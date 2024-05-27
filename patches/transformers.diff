@@ -1,0 +1,301 @@
+diff --git a/examples/pytorch/language-modeling/run_clm.py b/examples/pytorch/language-modeling/run_clm.py
+index 9111976ec..e9a60cc53 100755
+--- a/examples/pytorch/language-modeling/run_clm.py
++++ b/examples/pytorch/language-modeling/run_clm.py
+@@ -29,6 +29,7 @@ import warnings
+ from dataclasses import dataclass, field
+ from itertools import chain
+ from typing import Optional
++import timeit
+ 
+ import datasets
+ import evaluate
+@@ -48,12 +49,20 @@ from transformers import (
+     default_data_collator,
+     is_torch_xla_available,
+     set_seed,
++    TrainerCallback,
+ )
+ from transformers.testing_utils import CaptureLogger
+ from transformers.trainer_utils import get_last_checkpoint
+ from transformers.utils import check_min_version, send_example_telemetry
+ from transformers.utils.versions import require_version
+ 
++import functools
++from accelerate import init_empty_weights
++from transformers.utils import ContextManagers
++from transformers.modeling_utils import is_local_dist_rank_0
++from transformers.models.llama.modeling_llama import LlamaRMSNorm
++from accelerate.utils.dataclasses import FullyShardedDataParallelPlugin
++
+ 
+ # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
+ check_min_version("4.39.0")
+@@ -401,6 +410,9 @@ def main():
+         "revision": model_args.model_revision,
+         "token": model_args.token,
+         "trust_remote_code": model_args.trust_remote_code,
++        "return_dict": False,
++        "use_cache": False,
++        "attn_implementation": "flash_attention_2",
+     }
+     if model_args.config_name:
+         config = AutoConfig.from_pretrained(model_args.config_name, **config_kwargs)
+@@ -431,27 +443,28 @@ def main():
+             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
+         )
+ 
+-    if model_args.model_name_or_path:
+-        torch_dtype = (
+-            model_args.torch_dtype
+-            if model_args.torch_dtype in ["auto", None]
+-            else getattr(torch, model_args.torch_dtype)
+-        )
+-        model = AutoModelForCausalLM.from_pretrained(
+-            model_args.model_name_or_path,
+-            from_tf=bool(".ckpt" in model_args.model_name_or_path),
+-            config=config,
+-            cache_dir=model_args.cache_dir,
+-            revision=model_args.model_revision,
+-            token=model_args.token,
+-            trust_remote_code=model_args.trust_remote_code,
+-            torch_dtype=torch_dtype,
+-            low_cpu_mem_usage=model_args.low_cpu_mem_usage,
+-        )
+-    else:
+-        model = AutoModelForCausalLM.from_config(config, trust_remote_code=model_args.trust_remote_code)
+-        n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
+-        logger.info(f"Training new model from scratch - Total size={n_params/2**20:.2f}M params")
++    with ContextManagers([] if is_local_dist_rank_0() else [init_empty_weights()]):
++        if model_args.model_name_or_path:
++            torch_dtype = (
++                model_args.torch_dtype
++                if model_args.torch_dtype in ["auto", None]
++                else getattr(torch, model_args.torch_dtype)
++            )
++            model = AutoModelForCausalLM.from_pretrained(
++                model_args.model_name_or_path,
++                from_tf=bool(".ckpt" in model_args.model_name_or_path),
++                config=config,
++                cache_dir=model_args.cache_dir,
++                revision=model_args.model_revision,
++                token=model_args.token,
++                trust_remote_code=model_args.trust_remote_code,
++                torch_dtype=torch_dtype,
++                low_cpu_mem_usage=model_args.low_cpu_mem_usage,
++            )
++        else:
++            model = AutoModelForCausalLM.from_config(config, trust_remote_code=model_args.trust_remote_code)
++            n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
++            logger.info(f"Training new model from scratch - Total size={n_params/2**20:.2f}M params")
+ 
+     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
+     # on a small vocab and want a smaller embedding size, remove this test.
+@@ -594,6 +607,91 @@ def main():
+             return metric.compute(predictions=preds, references=labels)
+ 
+     # Initialize our Trainer
++    training_args.accelerator_config.fsdp_plugin = FullyShardedDataParallelPlugin(
++        mixed_precision_policy=torch.distributed.fsdp.MixedPrecision(
++            param_dtype=torch.bfloat16,
++            reduce_dtype=torch.float32,
++            buffer_dtype=None,
++        ),
++        auto_wrap_policy=lambda model: functools.partial(
++            torch.distributed.fsdp.wrap.lambda_auto_wrap_policy,
++            lambda_fn=lambda m: (
++                m is model.model.embed_tokens
++                or m in model.model.layers
++                or m is model.lm_head
++            ),
++        ),
++        activation_checkpointing_auto_wrap_policy=lambda model: functools.partial(
++            torch.distributed.fsdp.wrap.lambda_auto_wrap_policy,
++            lambda_fn=lambda m: (
++                m in (
++                    next(layer.children()) for layer in model.model.layers[:(
++                        len(model.model.layers)
++                        if training_args.accelerator_config.fsdp_plugin.num_layers_to_checkpoint is None
++                        else training_args.accelerator_config.fsdp_plugin.num_layers_to_checkpoint
++                    )]
++                )
++            )
++        ),
++        ya_fsdp_modules_to_wrap_with_names=lambda model: (
++            [(model.model.embed_tokens, "model.embed_tokens")]
++            + [
++                (
++                    m,
++                    f"model.layers.{i}",
++                )
++                for i, m in enumerate(model.model.layers)
++            ]
++            + [(model.lm_head, "lm_head")]
++        ),
++        ya_fsdp_output_layer_module_with_name=lambda model: (model.model.norm, "model.norm"),
++        ya_fsdp_layer_norm_module_cls=LlamaRMSNorm,
++    )
++
++    class ProfCallback(TrainerCallback):
++        def __init__(self, prof):
++            self.prof = prof
++
++        def on_step_end(self, args, state, control, **kwargs):
++            self.prof.step()
++
++    def trace_handler(prof):
++        if not trainer.is_world_process_zero():
++            return
++        prof.export_chrome_trace(
++            f"{training_args.output_dir}/trace_{prof.step_num}.json"
++        )
++
++    class IterTimeCallback(TrainerCallback):
++        def __init__(self):
++            self.start_time = None
++            self.iter_time = None
++
++        def on_step_begin(self, args, state, control, **kwargs):
++            assert self.start_time is None
++            self.start_time = timeit.default_timer()
++
++        def on_step_end(self, args, state, control, **kwargs):
++            assert self.iter_time is None
++            self.iter_time = timeit.default_timer() - self.start_time
++            self.start_time = None
++
++        def on_log(self, args, state, control, **kwargs):
++            if self.iter_time is not None:
++                kwargs["logs"]["iter_time"] = self.iter_time
++            self.iter_time = None
++
++    class MemorySnapshotCallback(TrainerCallback):
++        def __init__(self):
++            torch.cuda.memory._record_memory_history()
++
++        def on_step_end(self, args, state, control, **kwargs):
++            if state.global_step == 10 and trainer.args.process_index in range(8):
++                torch.cuda.memory._dump_snapshot(
++                    f"{training_args.output_dir}/memory_snapshot_{trainer.args.process_index}.pickle"
++                )
++
++
+     trainer = Trainer(
+         model=model,
+         args=training_args,
+@@ -606,6 +704,7 @@ def main():
+         preprocess_logits_for_metrics=preprocess_logits_for_metrics
+         if training_args.do_eval and not is_torch_xla_available()
+         else None,
++        callbacks=[IterTimeCallback, MemorySnapshotCallback]
+     )
+ 
+     # Training
+@@ -615,7 +714,13 @@ def main():
+             checkpoint = training_args.resume_from_checkpoint
+         elif last_checkpoint is not None:
+             checkpoint = last_checkpoint
+-        train_result = trainer.train(resume_from_checkpoint=checkpoint)
++        with torch.profiler.profile(
++            activities=[torch.profiler.ProfilerActivity.CUDA],
++            schedule=torch.profiler.schedule(wait=10, warmup=10, active=1, repeat=1),
++            on_trace_ready=trace_handler,
++        ) as prof:
++            trainer.add_callback(ProfCallback(prof=prof))
++            train_result = trainer.train(resume_from_checkpoint=checkpoint)
+         trainer.save_model()  # Saves the tokenizer too for easy upload
+ 
+         metrics = train_result.metrics
+diff --git a/src/transformers/modeling_utils.py b/src/transformers/modeling_utils.py
+index 263ae5d2f..57c8b6788 100644
+--- a/src/transformers/modeling_utils.py
++++ b/src/transformers/modeling_utils.py
+@@ -1304,7 +1304,7 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
+             dtype_orig = cls._set_default_torch_dtype(torch_dtype)
+ 
+         config = copy.deepcopy(config)  # We do not want to modify the config inplace in _from_config.
+-        config._attn_implementation = kwargs.pop("attn_implementation", None)
++        # config._attn_implementation = kwargs.pop("attn_implementation", None)
+         config = cls._autoset_attn_implementation(
+             config,
+             use_flash_attention_2=use_flash_attention_2,
+diff --git a/src/transformers/trainer.py b/src/transformers/trainer.py
+index ac014c672..36b85c37f 100755
+--- a/src/transformers/trainer.py
++++ b/src/transformers/trainer.py
+@@ -535,7 +535,7 @@ class Trainer:
+                 "You should subclass `Trainer` and override the `create_optimizer_and_scheduler` method."
+             )
+         default_callbacks = DEFAULT_CALLBACKS + get_reporting_integration_callbacks(self.args.report_to)
+-        callbacks = default_callbacks if callbacks is None else default_callbacks + callbacks
++        callbacks = default_callbacks if callbacks is None else callbacks + default_callbacks
+         self.callback_handler = CallbackHandler(
+             callbacks, self.model, self.tokenizer, self.optimizer, self.lr_scheduler
+         )
+@@ -3230,7 +3230,7 @@ class Trainer:
+             self.tokenizer.save_pretrained(output_dir)
+ 
+         # Good practice: save your training arguments together with the trained model
+-        torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
++        # torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
+ 
+     def store_flos(self):
+         # Storing the number of floating-point operations that went into the model
+diff --git a/src/transformers/trainer_pt_utils.py b/src/transformers/trainer_pt_utils.py
+index 13745be6c..28b5f0578 100644
+--- a/src/transformers/trainer_pt_utils.py
++++ b/src/transformers/trainer_pt_utils.py
+@@ -1223,6 +1223,7 @@ class AcceleratorConfig:
+             "multiple different seeds to compare. Should also be ran with [`~utils.set_seed`] for the best results."
+         },
+     )
++    fsdp_plugin: Optional[Any] = field(default=None)
+ 
+     @classmethod
+     def from_json_file(cls, json_file):
+@@ -1239,8 +1240,13 @@ class AcceleratorConfig:
+             )
+         return cls(**config_dict)
+ 
+-    def to_dict(self):
+-        return copy.deepcopy(self.__dict__)
++    def to_dict(self, json=False):
++        copied = copy.deepcopy(
++            {k: v for k, v in self.__dict__.items() if k != "fsdp_plugin"}
++        )
++        if not json:
++            copied["fsdp_plugin"] = self.__dict__["fsdp_plugin"]
++        return copied
+ 
+ 
+ class LayerWiseDummyOptimizer(torch.optim.Optimizer):
+diff --git a/src/transformers/training_args.py b/src/transformers/training_args.py
+index a52a77e9a..ad1a7786f 100644
+--- a/src/transformers/training_args.py
++++ b/src/transformers/training_args.py
+@@ -2229,7 +2229,7 @@ class TrainingArguments:
+         )
+         return warmup_steps
+ 
+-    def to_dict(self):
++    def to_dict(self, json=False):
+         """
+         Serializes this instance while replace `Enum` by their values (for JSON serialization support). It obfuscates
+         the token values by removing their value.
+@@ -2246,14 +2246,14 @@ class TrainingArguments:
+                 d[k] = f"<{k.upper()}>"
+             # Handle the accelerator_config if passed
+             if is_accelerate_available() and isinstance(v, AcceleratorConfig):
+-                d[k] = v.to_dict()
++                d[k] = v.to_dict(json=json)
+         return d
+ 
+     def to_json_string(self):
+         """
+         Serializes this instance to a JSON string.
+         """
+-        return json.dumps(self.to_dict(), indent=2)
++        return json.dumps(self.to_dict(json=True), indent=2)
+ 
+     def to_sanitized_dict(self) -> Dict[str, Any]:
+         """

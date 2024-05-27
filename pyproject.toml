@@ -1,0 +1,16 @@
+[project]
+version = "0.1.0"
+name = "ya_fdsp"
+
+[tool.setuptools.packages.find]
+include = ["ya_fsdp"]
+
+[tool.isort]
+profile = "black"
+py_version = "310"
+line_length = 120
+
+[tool.black]
+line-length = 120
+target-version = ["py310"]
+required-version = "23.7.0"

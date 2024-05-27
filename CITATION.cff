@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+- family-names: "Khrushchev"
+  given-names: "Mikhail"
+- family-names: "Frolov"
+  given-names: "Anton"
+- family-names: "Vasilev"
+  given-names: "Ruslan"
+title: "YaFSDP"
+date-released: 2024-05-XX
+url: "https://github.com/yandex/YaFSDP"

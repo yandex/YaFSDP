@@ -1,0 +1,159 @@
+diff --git a/examples/scripts/sft.py b/examples/scripts/sft.py
+index 1533906..fcb93bb 100644
+--- a/examples/scripts/sft.py
++++ b/examples/scripts/sft.py
+@@ -47,6 +47,7 @@ python examples/scripts/sft.py \
+ import logging
+ import os
+ from contextlib import nullcontext
++import timeit
+ 
+ TRL_USE_RICH = os.environ.get("TRL_USE_RICH", False)
+ 
+@@ -74,6 +75,14 @@ from trl import (
+     get_kbit_device_map,
+ )
+ 
++import functools
++from accelerate import init_empty_weights
++from transformers.utils import ContextManagers
++from transformers.modeling_utils import is_local_dist_rank_0
++from transformers.models.llama.modeling_llama import LlamaRMSNorm
++from accelerate.utils.dataclasses import FullyShardedDataParallelPlugin
++from transformers import TrainerCallback
++
+ tqdm.pandas()
+ 
+ if TRL_USE_RICH:
+@@ -103,9 +112,10 @@ if __name__ == "__main__":
+         trust_remote_code=model_config.trust_remote_code,
+         attn_implementation=model_config.attn_implementation,
+         torch_dtype=torch_dtype,
+-        use_cache=False if training_args.gradient_checkpointing else True,
++        use_cache=False,
+         device_map=get_kbit_device_map() if quantization_config is not None else None,
+         quantization_config=quantization_config,
++        return_dict=False,
+     )
+     tokenizer = AutoTokenizer.from_pretrained(model_config.model_name_or_path, use_fast=True)
+     tokenizer.pad_token = tokenizer.eos_token
+@@ -130,7 +140,91 @@ if __name__ == "__main__":
+     ################
+     # Training
+     ################
+-    with init_context:
++    training_args.accelerator_config.fsdp_plugin = FullyShardedDataParallelPlugin(
++        mixed_precision_policy=torch.distributed.fsdp.MixedPrecision(
++            param_dtype=torch.bfloat16,
++            reduce_dtype=torch.float32,
++            buffer_dtype=None,
++        ),
++        auto_wrap_policy=lambda model: functools.partial(
++            torch.distributed.fsdp.wrap.lambda_auto_wrap_policy,
++            lambda_fn=lambda m: (
++                m is model.model.embed_tokens
++                or m in model.model.layers
++                or m is model.lm_head
++            ),
++        ),
++        activation_checkpointing_auto_wrap_policy=lambda model: functools.partial(
++            torch.distributed.fsdp.wrap.lambda_auto_wrap_policy,
++            lambda_fn=lambda m: (
++                m in (
++                    next(layer.children()) for layer in model.model.layers[:(
++                        len(model.model.layers)
++                        if training_args.accelerator_config.fsdp_plugin.num_layers_to_checkpoint is None
++                        else training_args.accelerator_config.fsdp_plugin.num_layers_to_checkpoint
++                    )]
++                )
++            )
++        ),
++        ya_fsdp_modules_to_wrap_with_names=lambda model: (
++            [(model.model.embed_tokens, "model.embed_tokens")]
++            + [
++                (
++                    m,
++                    f"model.layers.{i}",
++                )
++                for i, m in enumerate(model.model.layers)
++            ]
++            + [(model.lm_head, "lm_head")]
++        ),
++        ya_fsdp_output_layer_module_with_name=lambda model: (model.model.norm, "model.norm"),
++        ya_fsdp_layer_norm_module_cls=LlamaRMSNorm,
++    )
++
++    class ProfCallback(TrainerCallback):
++        def __init__(self, prof):
++            self.prof = prof
++
++        def on_step_end(self, args, state, control, **kwargs):
++            self.prof.step()
++
++    def trace_handler(prof):
++        if not trainer.is_world_process_zero():
++            return
++        prof.export_chrome_trace(
++            f"{training_args.output_dir}/trace_{prof.step_num}.json"
++        )
++
++    class IterTimeCallback(TrainerCallback):
++        def __init__(self):
++            self.start_time = None
++            self.iter_time = None
++
++        def on_step_begin(self, args, state, control, **kwargs):
++            assert self.start_time is None
++            self.start_time = timeit.default_timer()
++
++        def on_step_end(self, args, state, control, **kwargs):
++            assert self.iter_time is None
++            self.iter_time = timeit.default_timer() - self.start_time
++            self.start_time = None
++
++        def on_log(self, args, state, control, **kwargs):
++            if self.iter_time is not None:
++                kwargs["logs"]["iter_time"] = self.iter_time
++            self.iter_time = None
++
++    class MemorySnapshotCallback(TrainerCallback):
++        def __init__(self):
++            torch.cuda.memory._record_memory_history()
++
++        def on_step_end(self, args, state, control, **kwargs):
++            if state.global_step == 10 and trainer.args.process_index in range(8):
++                torch.cuda.memory._dump_snapshot(
++                    f"{training_args.output_dir}/memory_snapshot_{trainer.args.process_index}.pickle"
++                )
++
++    with ContextManagers([init_context] + ([] if is_local_dist_rank_0() else [init_empty_weights()])):
+         trainer = SFTTrainer(
+             model=model_config.model_name_or_path,
+             model_init_kwargs=model_kwargs,
+@@ -142,10 +236,24 @@ if __name__ == "__main__":
+             tokenizer=tokenizer,
+             packing=args.packing,
+             peft_config=get_peft_config(model_config),
+-            callbacks=[RichProgressCallback] if TRL_USE_RICH else None,
++            callbacks=(([RichProgressCallback] if TRL_USE_RICH else []) + [IterTimeCallback, MemorySnapshotCallback])
+         )
+ 
+-    trainer.train()
++    with torch.profiler.profile(
++            activities=[torch.profiler.ProfilerActivity.CUDA],
++            schedule=torch.profiler.schedule(wait=10, warmup=10, active=1, repeat=1),
++            on_trace_ready=trace_handler,
++    ) as prof:
++        trainer.add_callback(ProfCallback(prof=prof))
++        train_result = trainer.train()
+ 
+     with save_context:
+         trainer.save_model(training_args.output_dir)
++
++        metrics = train_result.metrics
++
++        metrics["train_samples"] = len(train_dataset)
++
++        trainer.log_metrics("train", metrics)
++        trainer.save_metrics("train", metrics)
++        trainer.save_state()

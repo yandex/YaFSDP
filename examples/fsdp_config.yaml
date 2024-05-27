@@ -1,0 +1,19 @@
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+fsdp_config:
+  fsdp_backward_prefetch: BACKWARD_PRE
+  fsdp_cpu_ram_efficient_loading: false
+  fsdp_forward_prefetch: true
+  fsdp_offload_params: false
+  fsdp_sharding_strategy: FULL_SHARD
+  fsdp_state_dict_type: FULL_STATE_DICT
+  fsdp_sync_module_states: true
+  fsdp_use_orig_params: false
+  fsdp_activation_checkpointing: false
+  fsdp_num_layers_to_checkpoint: 0
+main_training_function: main
+main_process_ip: localhost
+mixed_precision: bf16
+num_processes: 2
+rdzv_backend: c10d
+same_network: true
