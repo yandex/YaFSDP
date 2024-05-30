@@ -7,6 +7,6 @@ authors:
   given-names: "Anton"
 - family-names: "Vasilev"
   given-names: "Ruslan"
-title: "YaFSDP"
-date-released: 2024-05-XX
+title: "YaFSDP: Yet another Fully Sharded Data Parallel"
+date-released: 2024-06-11
 url: "https://github.com/yandex/YaFSDP"

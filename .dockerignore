@@ -1,0 +1,4 @@
+.dockerignore
+docker/*
+README.md
+examples/*.md
