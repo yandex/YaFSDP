@@ -34,33 +34,40 @@ We've compared YaFSDP with FSDP on a variety of pre-training setups ranging from
 - 64 to 256 devices
 - 2048 to 8192 tokens per sequence
 
-In each run per device batch size is set to 1.
-
 | model       | gpu-count | seq-len | num-ckpt-layers | speedup |
 | :---------- | --------: | ------: | --------------: | ------: |
-| Llama-2-7b  |        64 |    2048 |               0 |   9.92% |
-| Llama-2-7b  |        64 |    4096 |               0 |   3.43% |
-| Llama-2-7b  |        64 |    8192 |               0 |   2.68% |
-| Llama-2-7b  |       128 |    2048 |               0 |   9.57% |
-| Llama-2-7b  |       128 |    4096 |               0 |   2.42% |
-| Llama-2-7b  |       128 |    8192 |               0 |   2.32% |
-| Llama-2-13b |       128 |    2048 |               0 |  12.10% |
-| Llama-2-13b |       128 |    4096 |               0 |   3.49% |
-| Llama-2-34b |       128 |    2048 |               0 |  20.70% |
-| Llama-2-34b |       256 |    2048 |               0 |  21.99% |
-| Llama-2-34b |       256 |    4096 |               5 |   8.35% |
-| Llama-2-70b |       256 |    2048 |              10 |  21.48% |
-| Llama-2-70b |       256 |    4096 |              50 |   7.17% |
-| Llama-3-8B  |        64 |    2048 |               0 |  10.15% |
-| Llama-3-8B  |        64 |    4096 |               0 |   7.98% |
-| Llama-3-70B |       256 |    2048 |              20 |  26.60% |
+| Llama 2 7B  |        64 |    2048 |               0 |   9.92% |
+| Llama 2 7B  |        64 |    4096 |               0 |   3.43% |
+| Llama 2 7B  |        64 |    8192 |               0 |   2.68% |
+| Llama 2 7B  |       128 |    2048 |               0 |   9.57% |
+| Llama 2 7B  |       128 |    4096 |               0 |   2.42% |
+| Llama 2 7B  |       128 |    8192 |               0 |   2.32% |
+| Llama 2 13B |       128 |    2048 |               0 |  12.10% |
+| Llama 2 13B |       128 |    4096 |               0 |   3.49% |
+| Llama 2 34B |       128 |    2048 |               0 |  20.70% |
+| Llama 2 34B |       256 |    2048 |               0 |  21.99% |
+| Llama 2 34B |       256 |    4096 |               5 |   8.35% |
+| Llama 2 70B |       256 |    2048 |              10 |  21.48% |
+| Llama 2 70B |       256 |    4096 |              50 |   7.17% |
+| Llama 3 8B  |        64 |    2048 |               0 |  10.15% |
+| Llama 3 8B  |        64 |    4096 |               0 |   7.98% |
+| Llama 3 70B |       256 |    2048 |              20 |  26.60% |
+
+Details:
+- In each run, per-device batch size is set to 1.
+- We report the relative difference in iteration time when switching from FSDP to YaFSDP as `speedup`.
+- `num-ckpt-layers` refers to the number of transformer layers for partial activation recomputation.
+- Evaluations were done at A100 80G cluster.
 
 ## Examples
 
 To try out YaFSDP you should:
+1. Build the docker image with `docker/build.sh`.
+2. Launch one of the examples in the `examples` folder.
 
-1. build the docker container with `docker/build.sh`
-2. launch one of the examples in the `examples` folder.
+The docker image is based on [NVIDIA image for PyTorch](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) with [transformers](https://github.com/huggingface/transformers), [accelerate](https://github.com/huggingface/accelerate), and [trl](https://github.com/huggingface/trl). Patches for the libraries are provided in [patches/](./patches/) and are needed for YaFSDP to work with huggingface.
+
+In the examples, we provide two common configurations for Llama-3 8B: `clm.md` for causal pre-training and `sft.md` for supervised fine-tuning.
 
 ## Issues and questions
 
