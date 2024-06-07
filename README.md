@@ -49,11 +49,12 @@ We've compared YaFSDP with FSDP on a variety of pre-training setups ranging from
 | Llama 2 34B |       256 |    4096 |               5 |   8.35% |
 | Llama 2 70B |       256 |    2048 |              10 |  21.48% |
 | Llama 2 70B |       256 |    4096 |              50 |   7.17% |
-| Llama 3 8B  |        64 |    2048 |               0 |  10.15% |
-| Llama 3 8B  |        64 |    4096 |               0 |   7.98% |
+| Llama 3 8B  |        64 |    2048 |               0 |  11.91% |
+| Llama 3 8B  |        64 |    4096 |               0 |   7.86% |
 | Llama 3 70B |       256 |    2048 |              20 |  26.60% |
 
 Details:
+
 - In each run, per-device batch size is set to 1.
 - We report the relative difference in iteration time when switching from FSDP to YaFSDP as `speedup`.
 - `num-ckpt-layers` refers to the number of transformer layers for partial activation recomputation.
@@ -62,6 +63,7 @@ Details:
 ## Examples
 
 To try out YaFSDP you should:
+
 1. Build the docker image with `docker/build.sh`.
 2. Launch one of the examples in the `examples` folder.
 
