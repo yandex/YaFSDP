@@ -73,7 +73,7 @@ In the examples, we provide two common configurations for Llama-3 8B: `clm.md` f
 
 ## Issues and questions
 
-If you encounter any bugs of have any questions feel free to open a GitHub issue.
+If you encounter any bugs of have any questions [feel free to open a GitHub issue](https://github.com/yandex/YaFSDP/issues/new).
 
 ## Citation
 
