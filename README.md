@@ -1,5 +1,8 @@
 # YaFSDP
-![](assets/yafsdp_logo.png)
+<div align="center">
+ <img src="assets/yafsdp_logo.png#gh-light-mode-only" width="400px">
+ <img src="assets/yafsdp_logo_white.png#gh-dark-mode-only" width="400px">
+</div>
 
 - [Overview](#overview)
 - [Advantages over FSDP](#advantages-over-fsdp)
