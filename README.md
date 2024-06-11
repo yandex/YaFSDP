@@ -1,4 +1,5 @@
 # YaFSDP
+![](assets/yafsdp_logo.png)
 
 - [Overview](#overview)
 - [Advantages over FSDP](#advantages-over-fsdp)
