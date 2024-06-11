@@ -62,14 +62,12 @@ Details:
 
 ## Examples
 
-To try out YaFSDP you should:
+You can find examples of LLM training using 🤗 stack in the `examples` folder:
 
-1. Build the docker image with `docker/build.sh`.
-2. Launch one of the examples in the `examples` folder.
+1. `clm.md` for causal pre-training
+2. `sft.md` for supervised fine-tuning
 
-The docker image is based on [NVIDIA image for PyTorch](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) with [transformers](https://github.com/huggingface/transformers), [accelerate](https://github.com/huggingface/accelerate), and [trl](https://github.com/huggingface/trl). Patches for the libraries are provided in [patches/](./patches/) and are needed for YaFSDP to work with huggingface.
-
-In the examples, we provide two common configurations for Llama-3 8B: `clm.md` for causal pre-training and `sft.md` for supervised fine-tuning.
+Notice that both examples require a Docker image, which can be built using `docker/build.sh` script. The image is based on the [NVIDIA PyTorch image](https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-02.html) with some patched 🤗 libraries. Patches for the libraries can be found in the `patches` folder.
 
 ## Issues and questions
 
