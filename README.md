@@ -3,6 +3,7 @@
  <img src="assets/yafsdp_logo.png#gh-light-mode-only" width="400px">
  <img src="assets/yafsdp_logo_white.png#gh-dark-mode-only" width="400px">
 </div>
+&nbsp;
 
 - [Overview](#overview)
 - [Advantages over FSDP](#advantages-over-fsdp)
