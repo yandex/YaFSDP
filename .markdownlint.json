@@ -1,0 +1,5 @@
+{
+    "MD033": {"allowed_elements": ["div", "img"]},
+    "MD045": false,
+    "MD013": {"tables": false}
+}
