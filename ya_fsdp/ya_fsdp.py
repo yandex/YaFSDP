@@ -61,7 +61,7 @@ class YaFSDP(nn.Module):
         bit32_acc_for_bit16_reduce_scatter (bool, optional):
             If True, uses a custom kernel for float32 accuracy for bfloat16 reduce scatter. Defaults to False.
         hpz_first_layers_num (int, optional):
-            Number for layers to apply HPZ to.
+            Number of layers to apply HPZ to.
             Defaults to 0.
         output_layer_module_with_name (tuple[nn.Module, str] | None, optional):
             Instance of output layer with a corresponding name. Output layer is
