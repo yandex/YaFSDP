@@ -283,6 +283,8 @@ class YaFSDP(nn.Module):
         self._layernorm_supertensor.set_weight_shard_buffers(
             self._layernorm_parameter_bit16, self._layernorm_parameter, 0
         )
+        if bit32_acc_for_bit16_reduce_scatter:
+            self._layernorm_supertensor.enable_bit32_acc_for_bit16_reduce_scatter()
 
         self._main_parameter = torch.nn.Parameter(torch.empty(sum_shards).float().cuda())
         self._main_parameter.grad = torch.zeros(sum_shards).float().cuda()
