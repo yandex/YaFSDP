@@ -965,16 +965,7 @@ class SuperTensorModule(torch.nn.Module):
         return self.root_module.forward(*args, **kwargs)
 
     def adopt_metaparams(self, main_param):
-        flatten_buffer = torch.cat(
-            [p.buffer for p in self.super_tensor.params]
-            + [
-                torch.zeros(
-                    self.super_tensor.padded_numel - self.super_tensor.total_numel,
-                    dtype=self.super_tensor.params[0].buffer.dtype,
-                    device=self.super_tensor.params[0].buffer.device,
-                )
-            ]
-        )
+        flatten_buffer = self.super_tensor.weight_reusable_buffer.get()
         shard = flatten_buffer.narrow(
             0, self.super_tensor.shard_size * self.super_tensor.rank, self.super_tensor.shard_size
         )  # .clone()
