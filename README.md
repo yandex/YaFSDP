@@ -14,8 +14,9 @@
 
 ## Overview
 
-YaFSDP is a Sharded Data Parallelism framework, designed to work well with transformer-like
-neural network architectures.
+YaFSDP is a Sharded Data Parallelism framework, designed to work well with
+transformer-like neural network architectures. YaFSDP is developed and
+maintained by Yandex.
 
 You can find more info on YaFSDP internals in our blog posts on
 [Medium](https://medium.com/yandex/yafsdp-a-tool-for-faster-llm-training-and-optimized-gpu-utilization-is-no-632b7539f5b3)
