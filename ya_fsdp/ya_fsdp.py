@@ -63,9 +63,9 @@ class YaFSDP(nn.Module):
         hpz_first_layers_num (int, optional):
             Number of layers to apply HPZ to.
             Defaults to 0.
-        output_layer_module_with_name (tuple[nn.Module, str] | None, optional):
-            Instance of output layer with a corresponding name. Output layer is
-            expected to contain only layer norm parameters.
+        rogue_layer_norm_modules_with_names (dict[nn.Module, str] | None, optional):
+            Mapping of modules which contain only layer norm parameters to
+            their corresponding names for state_dict.
             Defaults to None.
         sync_module_states (bool, optional):
             If True, module states are synced across
@@ -94,7 +94,7 @@ class YaFSDP(nn.Module):
         bit16_reduce_scatter: bool = False,
         bit32_acc_for_bit16_reduce_scatter: bool = False,
         hpz_first_layers_num: int = 0,
-        output_layer_module_with_name: tuple[nn.Module, str] | None = None,
+        rogue_layer_norm_modules_with_names: dict[nn.Module, str] | None = None,
         sync_module_states: bool = False,
         param_init_fn: Callable | None = None,
         device_id: int | None = None,
@@ -173,7 +173,7 @@ class YaFSDP(nn.Module):
         self._meta_info["layernorm_orig_shapes"] = []
 
         for module_ in self._module.modules():
-            if output_layer_module_with_name is not None and module_ is output_layer_module_with_name[0]:
+            if rogue_layer_norm_modules_with_names is not None and module_ in rogue_layer_norm_modules_with_names:
                 is_meta_module, _ = _need_to_materialize_module(module_, set(), set())
                 if sync_module_states and is_meta_module:
                     _materialize_with_param_init_fn(
@@ -195,7 +195,7 @@ class YaFSDP(nn.Module):
                     )
 
                 layer_unflattened_params = convert_some_params_to_metaparams(
-                    module_, output_layer_module_with_name[1], lambda _: True
+                    module_, rogue_layer_norm_modules_with_names[module_], lambda _: True
                 )
                 unflattened_params.extend(layer_unflattened_params)
                 self._meta_info["layernorm_fqns"].append(
@@ -276,20 +276,46 @@ class YaFSDP(nn.Module):
         self._layernorm_supertensor.set_buffers(self._layernorm_weight_buffer, self._layernorm_grad_buffer)
         self._layernorm_supertensor.set_fp32_grad_buffer(self._fp32_grad_buffer)
         self._layernorm_parameter = torch.nn.Parameter(
-            torch.empty(self._layernorm_supertensor.shard_size).float().cuda()
+            torch.empty(
+                self._layernorm_supertensor.shard_size,
+                dtype=torch.float,
+                device=self._device,
+            )
         )
-        self._layernorm_parameter.grad = torch.zeros(self._layernorm_supertensor.shard_size).float().cuda()
-        self._layernorm_parameter_bit16 = torch.empty(self._layernorm_supertensor.shard_size).to(param_dtype).cuda()
+        self._layernorm_parameter.grad = torch.zeros(
+            self._layernorm_supertensor.shard_size,
+            dtype=torch.float,
+            device=self._device,
+        )
+        self._layernorm_parameter_bit16 = torch.empty(
+            self._layernorm_supertensor.shard_size,
+            dtype=param_dtype,
+            device=self._device,
+        )
         self._layernorm_supertensor.set_weight_shard_buffers(
             self._layernorm_parameter_bit16, self._layernorm_parameter, 0
         )
         if bit32_acc_for_bit16_reduce_scatter:
             self._layernorm_supertensor.enable_bit32_acc_for_bit16_reduce_scatter()
 
-        self._main_parameter = torch.nn.Parameter(torch.empty(sum_shards).float().cuda())
-        self._main_parameter.grad = torch.zeros(sum_shards).float().cuda()
+        self._main_parameter = torch.nn.Parameter(
+            torch.empty(
+                sum_shards,
+                dtype=torch.float,
+                device=self._device,
+            )
+        )
+        self._main_parameter.grad = torch.zeros(
+            sum_shards,
+            dtype=torch.float,
+            device=self._device,
+        )
 
-        self._main_parameter_bit16 = torch.empty(sum_shards).to(param_dtype).cuda()
+        self._main_parameter_bit16 = torch.empty(
+            sum_shards,
+            dtype=param_dtype,
+            device=self._device,
+        )
         self._weight_buffers = [
             ReusableBuffer(
                 max_buffer_size if zero_stage == 3 else self._super_tensors[i].padded_numel,
@@ -435,7 +461,7 @@ class YaFSDP(nn.Module):
         state_dict = OrderedDict()
         for super_tensor in self._super_tensors:
             super_tensor.collect_module()
-            if self._data_parallel_process_group.rank() != 0:
+            if self._intra_node_data_parallel_process_group.rank() != 0:
                 continue
             for param in super_tensor.params:
                 data = getattr(param.parent_module, param.name)

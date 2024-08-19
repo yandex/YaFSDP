@@ -79,7 +79,7 @@ index 1533906..fcb93bb 100644
 +            ]
 +            + [(model.lm_head, "lm_head")]
 +        ),
-+        ya_fsdp_output_layer_module_with_name=lambda model: (model.model.norm, "model.norm"),
++        ya_fsdp_rogue_layer_norm_modules_with_names=lambda model: {model.model.norm: "model.norm"},
 +        ya_fsdp_layer_norm_module_cls=LlamaRMSNorm,
 +    )
 +

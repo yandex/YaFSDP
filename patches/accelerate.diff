@@ -46,7 +46,7 @@ index fb60473..046a04a 100755
 +                            param_dtype=fsdp_plugin.mixed_precision_policy.param_dtype,
 +                            modules_to_wrap_with_names=fsdp_plugin.ya_fsdp_modules_to_wrap_with_names,
 +                            gradient_accumulation_steps=self.gradient_accumulation_steps,
-+                            output_layer_module_with_name=fsdp_plugin.ya_fsdp_output_layer_module_with_name,
++                            rogue_layer_norm_modules_with_names=fsdp_plugin.ya_fsdp_rogue_layer_norm_modules_with_names,
 +                            sync_module_states=fsdp_plugin.sync_module_states,
 +                            param_init_fn=fsdp_plugin.param_init_fn,
 +                            layer_norm_module_cls=fsdp_plugin.ya_fsdp_layer_norm_module_cls,
@@ -141,7 +141,7 @@ index 730c777..3e9906a 100644
 +    activation_checkpointing_auto_wrap_policy: Optional[Callable] = field(default=None)
 +    ya_fsdp_enabled: bool = field(default=False)
 +    ya_fsdp_modules_to_wrap_with_names: Optional[list[tuple[torch.nn.Module, str]]] = field(default=None)
-+    ya_fsdp_output_layer_module_with_name: Optional[torch.nn.Module] = field(default=None)
++    ya_fsdp_rogue_layer_norm_modules_with_names: Optional[dict[torch.nn.Module, str]] = field(default=None)
 +    ya_fsdp_layer_norm_module_cls: Optional[Type[torch.nn.Module]] = field(default=None)
 +    num_layers_to_checkpoint: Optional[int] = field(default=None)
  
@@ -169,7 +169,7 @@ index 730c777..3e9906a 100644
 +            self.activation_checkpointing_auto_wrap_policy = self.activation_checkpointing_auto_wrap_policy(model)
 +            if self.ya_fsdp_enabled:
 +                self.ya_fsdp_modules_to_wrap_with_names = self.ya_fsdp_modules_to_wrap_with_names(model)
-+                self.ya_fsdp_output_layer_module_with_name = self.ya_fsdp_output_layer_module_with_name(model)
++                self.ya_fsdp_rogue_layer_norm_modules_with_names = self.ya_fsdp_rogue_layer_norm_modules_with_names(model)
  
      def set_mixed_precision(self, mixed_precision):
          if mixed_precision == "fp16":
