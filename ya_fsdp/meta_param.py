@@ -7,7 +7,8 @@ class Narrow(torch.autograd.Function):
         ctx.metaparam = metaparam
         ctx.set_materialize_grads(False)
         param_view = buffer.narrow(0, metaparam.offset, metaparam.numel).view(metaparam.shape)
-        param_view.grad_ = grad_buffer.narrow(0, metaparam.offset, metaparam.numel).view(metaparam.shape)
+        if grad_buffer is not None:
+            param_view.grad_ = grad_buffer.narrow(0, metaparam.offset, metaparam.numel).view(metaparam.shape)
         param_view.metaparam = metaparam
         return param_view
 

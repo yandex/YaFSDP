@@ -98,12 +98,14 @@ class YaFSDP(nn.Module):
         sync_module_states: bool = False,
         param_init_fn: Callable | None = None,
         device_id: int | None = None,
+        is_trainable: bool = True,
     ):
         super().__init__()
         self._module = module
         self._zero_stage = zero_stage
         self._gradient_accumulation_steps = gradient_accumulation_steps
         self._device = torch.device(torch.cuda.current_device() if device_id is None else device_id)
+        self.is_trainable = is_trainable
 
         self._data_parallel_process_group = (
             dist.distributed_c10d._get_default_group()
@@ -244,7 +246,7 @@ class YaFSDP(nn.Module):
 
         self._all_buffers = []
 
-        if not bit16_reduce_scatter:
+        if not bit16_reduce_scatter and is_trainable:
             self._fp32_grad_buffer = ReusableBuffer(
                 max(self._layernorm_supertensor.total_numel, max_buffer_size),
                 device="cuda",
@@ -263,34 +265,48 @@ class YaFSDP(nn.Module):
             prepare_stream=self._comm_stream,
             process_stream=self._compute_stream,
         )
-        self._layernorm_grad_buffer = ReusableBuffer(
-            self._layernorm_supertensor.padded_numel,
-            device="cuda",
-            dtype=param_dtype,
-            prepare_stream=self._compute_stream,
-            process_stream=self._comm_stream,
-            fill_zeros=True,
+        self._layernorm_grad_buffer = (
+            ReusableBuffer(
+                self._layernorm_supertensor.padded_numel,
+                device="cuda",
+                dtype=param_dtype,
+                prepare_stream=self._compute_stream,
+                process_stream=self._comm_stream,
+                fill_zeros=True,
+            )
+            if self.is_trainable
+            else None
         )
-        self._all_buffers.extend([self._layernorm_weight_buffer, self._layernorm_grad_buffer])
+        self._all_buffers.append(self._layernorm_weight_buffer)
+        if self.is_trainable:
+            self._all_buffers.append(self._layernorm_grad_buffer)
 
         self._layernorm_supertensor.set_buffers(self._layernorm_weight_buffer, self._layernorm_grad_buffer)
         self._layernorm_supertensor.set_fp32_grad_buffer(self._fp32_grad_buffer)
         self._layernorm_parameter = torch.nn.Parameter(
             torch.empty(
                 self._layernorm_supertensor.shard_size,
-                dtype=torch.float,
+                dtype=torch.float if self.is_trainable else param_dtype,
                 device=self._device,
             )
         )
-        self._layernorm_parameter.grad = torch.zeros(
-            self._layernorm_supertensor.shard_size,
-            dtype=torch.float,
-            device=self._device,
+        self._layernorm_parameter.grad = (
+            torch.zeros(
+                self._layernorm_supertensor.shard_size,
+                dtype=torch.float,
+                device=self._device,
+            )
+            if self.is_trainable
+            else None
         )
-        self._layernorm_parameter_bit16 = torch.empty(
-            self._layernorm_supertensor.shard_size,
-            dtype=param_dtype,
-            device=self._device,
+        self._layernorm_parameter_bit16 = (
+            torch.empty(
+                self._layernorm_supertensor.shard_size,
+                dtype=param_dtype,
+                device=self._device,
+            )
+            if self.is_trainable
+            else self._layernorm_parameter
         )
         self._layernorm_supertensor.set_weight_shard_buffers(
             self._layernorm_parameter_bit16, self._layernorm_parameter, 0
@@ -301,20 +317,28 @@ class YaFSDP(nn.Module):
         self._main_parameter = torch.nn.Parameter(
             torch.empty(
                 sum_shards,
-                dtype=torch.float,
+                dtype=torch.float if self.is_trainable else param_dtype,
                 device=self._device,
             )
         )
-        self._main_parameter.grad = torch.zeros(
-            sum_shards,
-            dtype=torch.float,
-            device=self._device,
+        self._main_parameter.grad = (
+            torch.zeros(
+                sum_shards,
+                dtype=torch.float,
+                device=self._device,
+            )
+            if self.is_trainable
+            else None
         )
 
-        self._main_parameter_bit16 = torch.empty(
-            sum_shards,
-            dtype=param_dtype,
-            device=self._device,
+        self._main_parameter_bit16 = (
+            torch.empty(
+                sum_shards,
+                dtype=param_dtype,
+                device=self._device,
+            )
+            if self.is_trainable
+            else self._main_parameter
         )
         self._weight_buffers = [
             ReusableBuffer(
@@ -335,10 +359,12 @@ class YaFSDP(nn.Module):
                 process_stream=self._comm_stream,
                 fill_zeros=True,
             )
+            if self.is_trainable
+            else None
             for i in range(2 if zero_stage > 1 else len(self._super_tensors))
         ]
         self._all_buffers.extend(self._weight_buffers)
-        self._all_buffers.extend(self._grad_buffers)
+        self._all_buffers.extend(self._grad_buffers if self.is_trainable else [])
 
         shard_buffer_offset = 0
         for idx, module_ in enumerate(m for m in self._module.modules() if isinstance(m, SuperTensorModule)):
@@ -742,10 +768,11 @@ class SuperTensor:
         self.weight_reusable_buffer = weight_reusable_buffer.get_prefix(
             self.total_numel, self.padded_numel, f"{self.name}_weight"
         )
-        self.grad_reusable_buffer = grad_reusable_buffer.get_prefix(
-            self.total_numel, self.padded_numel, f"{self.name}_grad"
-        )
-        self.grad_reusable_buffer.register_free_hook(lambda stream: self.reduce_scatter_grad(stream))
+        if grad_reusable_buffer is not None:
+            self.grad_reusable_buffer = grad_reusable_buffer.get_prefix(
+                self.total_numel, self.padded_numel, f"{self.name}_grad"
+            )
+            self.grad_reusable_buffer.register_free_hook(lambda stream: self.reduce_scatter_grad(stream))
 
     def set_fp32_grad_buffer(self, reusable_fp32_grad_buffer):
         if reusable_fp32_grad_buffer is not None:
@@ -761,7 +788,8 @@ class SuperTensor:
         self.shard.data = weight_shard_buffer.narrow(0, offset, self.shard_size)
         self.shard.data.copy_(old_shard)
         fp32_shard_buffer.data[offset : offset + self.shard_size] = old_shard
-        self.fp32_grad_shard = fp32_shard_buffer.grad.narrow(0, offset, self.shard_size)
+        if fp32_shard_buffer.grad is not None:
+            self.fp32_grad_shard = fp32_shard_buffer.grad.narrow(0, offset, self.shard_size)
         del old_shard
         if self.is_hpz_layer:
             self.hpz_buffer = torch.empty(self.hpz_shard_size, device=self.shard.device, dtype=self.shard.dtype)
@@ -843,7 +871,8 @@ class SuperTensor:
             requires_grad=True,
         )
         self.weight_grad_flow.data = weight_reusable_buffer_
-        self.weight_grad_flow.grad = self.grad_reusable_buffer.get()
+        if self.grad_reusable_buffer is not None:
+            self.weight_grad_flow.grad = self.grad_reusable_buffer.get()
 
     def get_forward_pre_hook(self):
         def forward_pre_hook(module, input):
@@ -886,7 +915,11 @@ class SuperTensor:
     def pre_forward(self, inputs):
         gated_ = GateGradFlow.apply(self.get_backward_hook(), self.weight_grad_flow, *inputs)
         weight_reusable_buffer = gated_[0]
-        materialize_params(self.params, weight_reusable_buffer, self.grad_reusable_buffer.get())
+        materialize_params(
+            self.params,
+            weight_reusable_buffer,
+            self.grad_reusable_buffer.get() if self.grad_reusable_buffer is not None else None,
+        )
         return list(gated_)[1:]
 
     def collect_module(self):
@@ -894,7 +927,9 @@ class SuperTensor:
         self.all_gather(self.comm_stream)  # collecting
         self.weight_reusable_buffer.start_processing(self)
         materialize_params(
-            self.params, self.weight_reusable_buffer.get(), self.grad_reusable_buffer.get()
+            self.params,
+            self.weight_reusable_buffer.get(),
+            self.grad_reusable_buffer.get() if self.grad_reusable_buffer is not None else None,
         )  # don't need grads here => None
         self.weight_reusable_buffer.end_processing(self)
 
