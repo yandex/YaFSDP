@@ -13,7 +13,7 @@ from torch.distributed.fsdp._init_utils import (
     _materialize_with_param_init_fn,
     _move_module_to_device,
     _need_to_materialize_module,
-    _sync_module_states,
+    _sync_module_params_and_buffers,
 )
 
 from .meta_param import MetaParam, convert_some_params_to_metaparams, materialize_params
@@ -190,9 +190,9 @@ class YaFSDP(nn.Module):
                     device_from_device_id=self._device,
                 )
                 if sync_module_states:
-                    _sync_module_states(
+                    _sync_module_params_and_buffers(
+                        module=module_,
                         params=list(module_.parameters()),
-                        buffers=list(module_.buffers()),
                         process_group=self._intra_node_data_parallel_process_group,
                     )
 
@@ -968,9 +968,9 @@ class SuperTensorModule(torch.nn.Module):
             device_from_device_id=device,
         )
         if sync_module_states:
-            _sync_module_states(
+            _sync_module_params_and_buffers(
+                module=root_module,
                 params=list(root_module.parameters()),
-                buffers=list(root_module.buffers()),
                 process_group=intra_node_data_parallel_process_group,
             )
 
