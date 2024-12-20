@@ -25,6 +25,41 @@ class ReusableBufferViewState(Enum):
     IN_PROCESS = 3
 
 
+def create_yccl_handle(model_parallel_group, yccl_intra_inter_expr, profile):
+    rank = torch.distributed.get_rank()
+    mp_size = model_parallel_group.size()
+    gpu_count = torch.cuda.device_count()
+
+    if yccl_intra_inter_expr is not None:
+        intra_color, inter_color = eval(
+            yccl_intra_inter_expr,
+            {},
+            {"rank": rank},
+        )
+    else:
+        # Inter-hosts communication only happens across GPUs with the same device index.
+        inter_color = rank % gpu_count
+        # Two ranks have the same intra-color if and only if:
+        #   * they are located on the same host (the first addend)
+        #   * are responsible for the same model part (the second addend)
+        # For instance, suppose we have 2 hosts, 8 GPUs per host, and 2 model parts.
+        # The intra-colors are assigned like this:
+        #   0 1 0 1 0 1 0 1 <-- host 0
+        #   2 3 2 3 2 3 2 3 <-- host 1
+        intra_color = mp_size * (rank // gpu_count) + rank % mp_size
+
+    # YCCL is an optional dependency; import only if the user opted in explicitly.
+    import yccl
+
+    yccl_handle = yccl.Handle(
+        inter_color=inter_color,
+        intra_color=intra_color,
+    )
+    if profile:
+        yccl_handle.enable_profiling()
+    return yccl_handle
+
+
 class YaFSDP(nn.Module):
     """A wrapper for sharding module parameters with YaFSDP.
 
@@ -77,6 +112,20 @@ class YaFSDP(nn.Module):
         device_id (int | None, optional):
             Device to use for initialization and sharding.
             Defaults to None.
+        use_yccl (bool, optional):
+            If both `use_yccl` and `bit16_reduce_scatter` are True, use all-to-all-based collectives from YCCL
+            for 16-bit non-layer-norm all-gathers and reduce-scatters. For these collectives, YCCL always uses
+            32-bit accumulators, so the value of `bit32_acc_for_bit16_reduce_scatter` is ignored. It is still
+            respected for layer-norm reduce-scatters, though.
+            Defaults to False.
+        yccl_intra_inter_expr (str | None, optional):
+            A string that with a Python expression that evaluates to a pair of intra- and inter-colors for YCCL.
+            Should only be used for rare cases where YCCL can't automatically derive the colors (e.g., single-host
+            tests over InfiniBand loopback).
+            Defaults to None.
+        profile (bool, optional):
+            If True, enable extended profiling events in PyTorch traces.
+            Defaults to False.
     """
 
     def __init__(
@@ -99,6 +148,9 @@ class YaFSDP(nn.Module):
         param_init_fn: Callable | None = None,
         device_id: int | None = None,
         is_trainable: bool = True,
+        use_yccl: bool = False,
+        yccl_intra_inter_expr: str | None = None,
+        profile: bool = False,
     ):
         super().__init__()
         self._module = module
@@ -119,6 +171,13 @@ class YaFSDP(nn.Module):
         )
         self._model_parallel_process_group = model_parallel_process_group
 
+        if use_yccl:
+            self._yccl_handle = create_yccl_handle(self._model_parallel_process_group, yccl_intra_inter_expr, profile)
+            if hpz_first_layers_num > 0:
+                raise ValueError(f"Requested {hpz_first_layers_num} HPZ layers, but YCCL is incompatible with HPZ")
+        else:
+            self._yccl_handle = None
+
         self._compute_stream = torch.cuda.current_stream()
         self._comm_stream = torch.cuda.Stream(priority=-1)
         self._hpz_all_gather_stream = torch.cuda.Stream(priority=-1) if hpz_first_layers_num > 0 else None
@@ -136,6 +195,7 @@ class YaFSDP(nn.Module):
                 "param_init_fn": param_init_fn,
                 "layer_norm_module_cls": layer_norm_module_cls,
                 "device": self._device,
+                "use_yccl_padding": use_yccl,
             }
             for idx, (m, name) in enumerate(modules_to_wrap_with_names)
         }
@@ -241,6 +301,7 @@ class YaFSDP(nn.Module):
             intra_node_data_parallel_process_group=self._intra_node_data_parallel_process_group,
             model_parallel_process_group=self._model_parallel_process_group,
             all_reduce_grads_across_model_parallel_group=all_reduce_grads_across_model_parallel_group,
+            use_yccl_padding=use_yccl,
         )
         self._super_tensors.append(self._layernorm_supertensor)
 
@@ -331,15 +392,18 @@ class YaFSDP(nn.Module):
             else None
         )
 
-        self._main_parameter_bit16 = (
-            torch.empty(
-                sum_shards,
-                dtype=param_dtype,
-                device=self._device,
-            )
-            if self.is_trainable
-            else self._main_parameter
-        )
+        if not self.is_trainable:
+            self._main_parameter_bit16 = self._main_parameter
+        else:
+            if self._yccl_handle is not None:
+                self._main_parameter_bit16 = self._yccl_handle.add_all_gather_input_buffer(sum_shards)
+            else:
+                self._main_parameter_bit16 = torch.empty(
+                    sum_shards,
+                    dtype=param_dtype,
+                    device=self._device,
+                )
+
         self._weight_buffers = [
             ReusableBuffer(
                 max_buffer_size if zero_stage == 3 else self._super_tensors[i].padded_numel,
@@ -347,6 +411,8 @@ class YaFSDP(nn.Module):
                 dtype=param_dtype,
                 prepare_stream=self._comm_stream,
                 process_stream=self._compute_stream,
+                yccl_handle=self._yccl_handle,
+                yccl_all_gather_input=self._main_parameter_bit16 if self._yccl_handle is not None else None,
             )
             for i in range(2 if zero_stage == 3 else len(self._super_tensors))
         ]
@@ -358,6 +424,7 @@ class YaFSDP(nn.Module):
                 prepare_stream=self._compute_stream,
                 process_stream=self._comm_stream,
                 fill_zeros=True,
+                yccl_handle=self._yccl_handle,
             )
             if self.is_trainable
             else None
@@ -406,6 +473,10 @@ class YaFSDP(nn.Module):
             comm_wait_event = torch.cuda.Event()
             comm_wait_event.record(self._comm_stream)
             comm_wait_event.wait()
+
+            if self._yccl_handle is not None:
+                # `process_profiling_events()` is a no-op if profiling wasn't enabled initially, so call it unconditionally.
+                self._yccl_handle.process_profiling_events()
 
             divider = self._data_parallel_process_group.size() * self._gradient_accumulation_steps
             self._main_parameter.grad.data.div_(divider)
@@ -531,12 +602,28 @@ class YaFSDP(nn.Module):
 
 
 class ReusableBuffer:
-    def __init__(self, size, dtype, device, prepare_stream, process_stream, fill_zeros=False):
-        self._buffer = (
-            torch.zeros(size, dtype=dtype, device=device)
-            if fill_zeros
-            else torch.empty(size, dtype=dtype, device=device)
-        )
+    def __init__(
+        self,
+        size,
+        dtype,
+        device,
+        prepare_stream,
+        process_stream,
+        fill_zeros=False,
+        yccl_handle=None,
+        yccl_all_gather_input=None,
+    ):
+        self.yccl_handle = yccl_handle
+        if self.yccl_handle is None:
+            self._buffer = (
+                torch.zeros(size, dtype=dtype, device=device)
+                if fill_zeros
+                else torch.empty(size, dtype=dtype, device=device)
+            )
+        elif yccl_all_gather_input is None:
+            self._buffer = self.yccl_handle.add_reduce_scatter_buffer(size)
+        else:
+            self._buffer = self.yccl_handle.add_all_gather_output_buffer(yccl_all_gather_input)
         self._owner = None
 
         self._prepared_event = None
@@ -697,6 +784,7 @@ class SuperTensor:
         all_reduce_grads_across_model_parallel_group=False,
         is_hpz_layer=False,
         hpz_all_gather_stream=None,
+        use_yccl_padding=False,
     ):
         assert len(params) > 0
         assert all(isinstance(param, MetaParam) for param in params)
@@ -725,6 +813,13 @@ class SuperTensor:
 
         if self.padded_numel % self.world_size != 0:
             self.padded_numel += self.world_size - self.padded_numel % self.world_size
+            if use_yccl_padding:
+                assert self.padded_numel % self.world_size == 0
+                chunk_size = self.padded_numel // self.world_size
+                # assuming bfloat16 elements, pad to 16-byte boundary
+                if chunk_size % 8 != 0:
+                    chunk_size += 8 - chunk_size % 8
+                    self.padded_numel = chunk_size * self.world_size
 
         flatten_buffer = torch.cat(
             [p.param.view(-1) for p in params]
@@ -806,12 +901,18 @@ class SuperTensor:
         with torch.cuda.stream(all_gather_stream):
             self.weight_reusable_buffer.set_prepare_stream(all_gather_stream)
             self.weight_reusable_buffer.start_prepare(self)
-            torch.distributed.all_gather_into_tensor(
-                self.weight_reusable_buffer.get(),
-                self.shard if not gather_from_hpz else self.hpz_buffer,
-                group=self._data_parallel_process_group if not gather_from_hpz else self.hpz_group,
-                async_op=False,
-            )
+            yccl_handle = self.weight_reusable_buffer.reusable_buffer.yccl_handle
+            if yccl_handle is None:
+                torch.distributed.all_gather_into_tensor(
+                    self.weight_reusable_buffer.get(),
+                    self.shard if not gather_from_hpz else self.hpz_buffer,
+                    group=self._data_parallel_process_group if not gather_from_hpz else self.hpz_group,
+                    async_op=False,
+                )
+            else:
+                # HPZ+YCCL is explicitly forbidden by the `YaFSDP()` constructor.
+                assert not gather_from_hpz, "Unexpected YCCL handle when HPZ is enabled"
+                yccl_handle.all_gather(self.shard, self.weight_reusable_buffer.get())
             self.weight_reusable_buffer.end_prepare(self)
             self.weight_reusable_buffer.unset_prepare_stream()
 
@@ -847,11 +948,18 @@ class SuperTensor:
             if self.bit32_acc_for_bit16_reduce_scatter and target_tensor.dtype == torch.bfloat16:
                 # Only bfloat16 -> float32 ReduceScatter is currently supported.
                 kwargs["acc_type"] = torch.float32
-            torch.distributed.reduce_scatter_tensor(
-                target_tensor,
-                reduce_grad_buffer.get(),
-                **kwargs,
-            )
+            yccl_handle = reduce_grad_buffer.reusable_buffer.yccl_handle
+            if yccl_handle is None:
+                torch.distributed.reduce_scatter_tensor(
+                    target_tensor,
+                    reduce_grad_buffer.get(),
+                    **kwargs,
+                )
+            else:
+                # `reduce_in_master_grad == True` implies `reduce_grad_buffer` is set to `self.reusable_fp32_grad_buffer`,
+                # which is a sub-tensor of `self._fp32_grad_buffer`, which is created without an YCCL handle.
+                assert not reduce_in_master_grad, "Unexpected YCCL handle for a FP32 grad buffer"
+                yccl_handle.reduce_scatter(reduce_grad_buffer.get())
             if self.all_reduce_grads_across_model_parallel_group:
                 torch.distributed.all_reduce(target_tensor, group=self._model_parallel_process_group)
             if not reduce_in_master_grad:
@@ -949,6 +1057,7 @@ class SuperTensorModule(torch.nn.Module):
         hpz_all_gather_stream=None,
         sync_module_states: bool = False,
         param_init_fn: Callable | None = None,
+        use_yccl_padding: bool = False,
     ):
         super(SuperTensorModule, self).__init__()
         self.name = name
@@ -999,6 +1108,7 @@ class SuperTensorModule(torch.nn.Module):
             model_parallel_process_group=model_parallel_process_group,
             is_hpz_layer=is_hpz_layer,
             hpz_all_gather_stream=hpz_all_gather_stream,
+            use_yccl_padding=use_yccl_padding,
         )
 
         self.register_forward_pre_hook(self.super_tensor.get_forward_pre_hook())
