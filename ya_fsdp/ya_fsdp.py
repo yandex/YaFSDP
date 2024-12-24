@@ -118,6 +118,10 @@ class YaFSDP(nn.Module):
             32-bit accumulators, so the value of `bit32_acc_for_bit16_reduce_scatter` is ignored. It is still
             respected for layer-norm reduce-scatters, though.
             Defaults to False.
+        use_yccl_padding (bool, optional):
+            If `use_yccl` is False, pad the supertensors YCCL-style for compatibility with checkpoints created
+            previously with `use_yccl=True`. If `use_yccl` is True, this option is ignored, and YCCL-style padding
+            is used unconditionally. Defaults to False.
         yccl_intra_inter_expr (str | None, optional):
             A string that with a Python expression that evaluates to a pair of intra- and inter-colors for YCCL.
             Should only be used for rare cases where YCCL can't automatically derive the colors (e.g., single-host
@@ -149,6 +153,7 @@ class YaFSDP(nn.Module):
         device_id: int | None = None,
         is_trainable: bool = True,
         use_yccl: bool = False,
+        use_yccl_padding: bool = False,
         yccl_intra_inter_expr: str | None = None,
         profile: bool = False,
     ):
@@ -172,6 +177,8 @@ class YaFSDP(nn.Module):
         self._model_parallel_process_group = model_parallel_process_group
 
         if use_yccl:
+            # `use_yccl` implies `use_yccl_padding`
+            use_yccl_padding = True
             self._yccl_handle = create_yccl_handle(self._model_parallel_process_group, yccl_intra_inter_expr, profile)
             if hpz_first_layers_num > 0:
                 raise ValueError(f"Requested {hpz_first_layers_num} HPZ layers, but YCCL is incompatible with HPZ")
@@ -195,7 +202,7 @@ class YaFSDP(nn.Module):
                 "param_init_fn": param_init_fn,
                 "layer_norm_module_cls": layer_norm_module_cls,
                 "device": self._device,
-                "use_yccl_padding": use_yccl,
+                "use_yccl_padding": use_yccl_padding,
             }
             for idx, (m, name) in enumerate(modules_to_wrap_with_names)
         }
@@ -301,7 +308,7 @@ class YaFSDP(nn.Module):
             intra_node_data_parallel_process_group=self._intra_node_data_parallel_process_group,
             model_parallel_process_group=self._model_parallel_process_group,
             all_reduce_grads_across_model_parallel_group=all_reduce_grads_across_model_parallel_group,
-            use_yccl_padding=use_yccl,
+            use_yccl_padding=use_yccl_padding,
         )
         self._super_tensors.append(self._layernorm_supertensor)
 
