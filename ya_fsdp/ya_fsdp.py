@@ -396,7 +396,9 @@ class YaFSDP(nn.Module):
             self._main_parameter_bit16 = self._main_parameter
         else:
             if self._yccl_handle is not None:
-                self._main_parameter_bit16 = self._yccl_handle.add_all_gather_input_buffer(sum_shards)
+                self._main_parameter_bit16 = self._yccl_handle.add_all_gather_input_buffer(
+                    max_chunk_numel=max_shard, buffer_numel=sum_shards
+                )
             else:
                 self._main_parameter_bit16 = torch.empty(
                     sum_shards,
