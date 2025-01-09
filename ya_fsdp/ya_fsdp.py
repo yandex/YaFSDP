@@ -822,13 +822,13 @@ class SuperTensor:
 
         if self.padded_numel % self.world_size != 0:
             self.padded_numel += self.world_size - self.padded_numel % self.world_size
-            if use_yccl_padding:
-                assert self.padded_numel % self.world_size == 0
-                chunk_size = self.padded_numel // self.world_size
-                # assuming bfloat16 elements, pad to 16-byte boundary
-                if chunk_size % 8 != 0:
-                    chunk_size += 8 - chunk_size % 8
-                    self.padded_numel = chunk_size * self.world_size
+        if use_yccl_padding:
+            assert self.padded_numel % self.world_size == 0
+            chunk_size = self.padded_numel // self.world_size
+            # assuming bfloat16 elements, pad to 16-byte boundary
+            if chunk_size % 8 != 0:
+                chunk_size += 8 - chunk_size % 8
+                self.padded_numel = chunk_size * self.world_size
 
         flatten_buffer = torch.cat(
             [p.param.view(-1) for p in params]
