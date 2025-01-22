@@ -2,7 +2,7 @@ import gc
 import time
 from collections import OrderedDict
 from enum import Enum
-from typing import Any, Callable, Type
+from typing import Any, Callable, Optional, Type
 
 import torch
 import torch.distributed as dist
@@ -23,6 +23,11 @@ class ReusableBufferViewState(Enum):
     NOT_READY = 1
     READY = 2
     IN_PROCESS = 3
+
+
+class ReusableBufferRoleForYccl(Enum):
+    ALL_GATHER = 1
+    REDUCE_SCATTER = 2
 
 
 def create_yccl_handle(model_parallel_group, yccl_intra_inter_expr, profile):
@@ -403,9 +408,7 @@ class YaFSDP(nn.Module):
             self._main_parameter_bit16 = self._main_parameter
         else:
             if self._yccl_handle is not None:
-                self._main_parameter_bit16 = self._yccl_handle.add_all_gather_input_buffer(
-                    max_chunk_numel=max_shard, buffer_numel=sum_shards
-                )
+                self._main_parameter_bit16 = self._yccl_handle.add_all_gather_input_buffer(numel=sum_shards)
             else:
                 self._main_parameter_bit16 = torch.empty(
                     sum_shards,
@@ -421,7 +424,7 @@ class YaFSDP(nn.Module):
                 prepare_stream=self._comm_stream,
                 process_stream=self._compute_stream,
                 yccl_handle=self._yccl_handle,
-                yccl_all_gather_input=self._main_parameter_bit16 if self._yccl_handle is not None else None,
+                yccl_role=ReusableBufferRoleForYccl.ALL_GATHER,
             )
             for i in range(2 if zero_stage == 3 else len(self._super_tensors))
         ]
@@ -434,6 +437,7 @@ class YaFSDP(nn.Module):
                 process_stream=self._comm_stream,
                 fill_zeros=True,
                 yccl_handle=self._yccl_handle,
+                yccl_role=ReusableBufferRoleForYccl.REDUCE_SCATTER,
             )
             if self.is_trainable
             else None
@@ -620,19 +624,23 @@ class ReusableBuffer:
         process_stream,
         fill_zeros=False,
         yccl_handle=None,
-        yccl_all_gather_input=None,
+        yccl_role: Optional[ReusableBufferRoleForYccl] = None,
     ):
         self.yccl_handle = yccl_handle
-        if self.yccl_handle is None:
+        if self.yccl_handle is not None:
+            assert yccl_role is not None, "Expected a non-None `yccl_role` when YCCL is used for a buffer"
+            if yccl_role == ReusableBufferRoleForYccl.REDUCE_SCATTER:
+                self._buffer = self.yccl_handle.add_reduce_scatter_buffer(numel=size)
+            elif yccl_role == ReusableBufferRoleForYccl.ALL_GATHER:
+                self._buffer = self.yccl_handle.add_all_gather_output_buffer(numel=size)
+            else:
+                raise ValueError(f"Unknown YCCL role: {yccl_role}")
+        else:
             self._buffer = (
                 torch.zeros(size, dtype=dtype, device=device)
                 if fill_zeros
                 else torch.empty(size, dtype=dtype, device=device)
             )
-        elif yccl_all_gather_input is None:
-            self._buffer = self.yccl_handle.add_reduce_scatter_buffer(size)
-        else:
-            self._buffer = self.yccl_handle.add_all_gather_output_buffer(yccl_all_gather_input)
         self._owner = None
 
         self._prepared_event = None
