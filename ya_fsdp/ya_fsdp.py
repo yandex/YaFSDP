@@ -30,7 +30,7 @@ class ReusableBufferRoleForYccl(Enum):
     REDUCE_SCATTER = 2
 
 
-def create_yccl_handle(model_parallel_group, yccl_intra_inter_expr, profile):
+def create_yccl_handle(model_parallel_group, yccl_intra_inter_expr, yccl_all_gather_stages, profile):
     rank = torch.distributed.get_rank()
     mp_size = model_parallel_group.size()
     gpu_count = torch.cuda.device_count()
@@ -59,6 +59,7 @@ def create_yccl_handle(model_parallel_group, yccl_intra_inter_expr, profile):
     yccl_handle = yccl.Handle(
         inter_color=inter_color,
         intra_color=intra_color,
+        all_gather_stages=yccl_all_gather_stages,
     )
     if profile:
         yccl_handle.enable_profiling()
@@ -160,6 +161,7 @@ class YaFSDP(nn.Module):
         use_yccl: bool = False,
         use_yccl_padding: bool = False,
         yccl_intra_inter_expr: str | None = None,
+        yccl_all_gather_stages: int | None = None,
         profile: bool = False,
     ):
         super().__init__()
@@ -184,7 +186,9 @@ class YaFSDP(nn.Module):
         if use_yccl:
             # `use_yccl` implies `use_yccl_padding`
             use_yccl_padding = True
-            self._yccl_handle = create_yccl_handle(self._model_parallel_process_group, yccl_intra_inter_expr, profile)
+            self._yccl_handle = create_yccl_handle(
+                self._model_parallel_process_group, yccl_intra_inter_expr, yccl_all_gather_stages, profile
+            )
             if hpz_first_layers_num > 0:
                 raise ValueError(f"Requested {hpz_first_layers_num} HPZ layers, but YCCL is incompatible with HPZ")
         else:
