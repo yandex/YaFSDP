@@ -1,6 +1,6 @@
 [project]
 version = "0.1.0"
-name = "ya_fdsp"
+name = "ya_fsdp"
 
 [tool.setuptools.packages.find]
 include = ["ya_fsdp"]

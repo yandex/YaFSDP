@@ -1,0 +1,39 @@
+{
+  "image": "nvcr.io/nvidia/pytorch:24.10-py3",
+  "containerUser": "root",
+  "name": "ya_fsdp",
+  "runArgs": [
+    "--name", "ya_fsdp",
+    "--restart", "unless-stopped"
+  ],
+  "postCreateCommand": {
+    "packages-editable-mode-compat": "pip install --config-settings editable_mode=compat -e /workspaces/YaFSDP"
+  },
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "[python]": {
+          "editor.defaultFormatter": "ms-python.black-formatter"
+        },
+        "isort.check": true,
+        "isort.path": [
+          "/usr/local/bin/isort"
+        ],
+        "black-formatter.path": [
+          "/usr/local/bin/black"
+        ]
+      },
+      "extensions": [
+        "DavidAnson.vscode-markdownlint",
+        "jeff-hykin.better-dockerfile-syntax",
+        "jeff-hykin.better-shellscript-syntax",
+        "ms-python.black-formatter",
+        "ms-python.isort",
+        "ms-python.python",
+        "ms-toolsai.jupyter",
+        "streetsidesoftware.code-spell-checker",
+        "timonwong.shellcheck"
+      ]
+    }
+  }
+}

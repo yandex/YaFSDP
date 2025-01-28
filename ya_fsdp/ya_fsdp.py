@@ -587,24 +587,6 @@ class YaFSDP(nn.Module):
         state_dict = {f"_{key}": value for key, value in state_dict.items()}
         super().load_state_dict(state_dict)
 
-    def get_files_to_load(self):
-        files_to_load = [
-            "latest",
-            "iteration_info",
-        ]  # common meta
-        files_to_load.append(f"reader_{torch.distributed.get_rank()}.pkl")  # reader
-        model_parallel_rank = (
-            0 if self._model_parallel_process_group is None else self._model_parallel_process_group.rank()
-        )
-        files_to_load.append(
-            f"yafsdp_optim_{self._data_parallel_process_group.rank():05d}_{model_parallel_rank:02d}.pt"
-        )
-        files_to_load.append("lr_scheduler.pt")  # lr scheduler for all the same
-        files_to_load.append(
-            f"yafsdp_model_{self._data_parallel_process_group.rank():05d}_{model_parallel_rank:02d}.pt"
-        )  # local "shard"
-        return files_to_load
-
     def zero_grad(self, *args, **kwargs) -> None:
         set_to_none = False
         if args:
