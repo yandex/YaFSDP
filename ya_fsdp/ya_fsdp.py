@@ -1168,7 +1168,7 @@ class SuperTensorModule(torch.nn.Module):
         flatten_buffer = self.super_tensor.weight_reusable_buffer.get()
         shard = flatten_buffer.narrow(
             0, self.super_tensor.shard_size * self.super_tensor.rank, self.super_tensor.shard_size
-        )  # .clone()
+        )
         with torch.no_grad():
             main_param[
                 self.super_tensor.shard_offset : self.super_tensor.shard_offset + self.super_tensor.shard_size
