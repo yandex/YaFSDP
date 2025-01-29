@@ -15,6 +15,7 @@ from torch.distributed.fsdp._init_utils import (
     _need_to_materialize_module,
     _sync_module_params_and_buffers,
 )
+from torch.distributed.utils import _replace_by_prefix
 
 from .meta_param import MetaParam, convert_some_params_to_metaparams, materialize_params
 
@@ -775,6 +776,28 @@ class GateGradFlow(torch.autograd.Function):
         return None, *grads
 
 
+def _get_extend_prefix_load_state_dict_pre_hook(wrapped_module_name: str, endswith: str = ""):
+    def load_state_dict_pre_hook(state_dict, prefix, *args):
+        _replace_by_prefix(
+            state_dict,
+            old_prefix=f"{prefix}{endswith}",
+            new_prefix=f"{prefix}{wrapped_module_name}.{endswith}",
+        )
+
+    return load_state_dict_pre_hook
+
+
+def _get_remove_prefix_state_dict_post_hook(wrapped_module_name: str, endswith: str = ""):
+    def load_state_dict_pre_hook(module, state_dict, prefix, *args):
+        _replace_by_prefix(
+            state_dict,
+            old_prefix=f"{prefix}{wrapped_module_name}.{endswith}",
+            new_prefix=f"{prefix}{endswith}",
+        )
+
+    return load_state_dict_pre_hook
+
+
 class SuperTensor:
     def __init__(
         self,
@@ -1118,6 +1141,9 @@ class SuperTensorModule(torch.nn.Module):
         self.register_forward_hook(self.super_tensor.get_forward_hook())
 
         self.register_full_backward_pre_hook(self.super_tensor.get_backward_pre_hook())
+
+        self._register_load_state_dict_pre_hook(_get_extend_prefix_load_state_dict_pre_hook("root_module"))
+        self._register_state_dict_hook(_get_remove_prefix_state_dict_post_hook("root_module"))
 
     def __getattr__(self, name: str) -> Any:
         """Forward missing attributes to the wrapped module."""
