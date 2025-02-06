@@ -322,7 +322,7 @@ class YaFSDPParamGroup:
             self.unshard()
             self.wait_for_unshard()
         if (owner := self._grad_buffer_ctx.owner) is not None and owner != self:
-            raise RuntimeError(f"Gradient buffer is already in use by {owner}")
+            raise RuntimeError(f"{self} tried to acquire its gradient buffer, but it is in use by {owner}")
         else:
             if (release_event := self._grad_buffer_ctx.release_event) is not None:
                 self.device_handle.current_stream().wait_event(release_event)
