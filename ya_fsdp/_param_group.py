@@ -730,6 +730,11 @@ class RegisterPostBackwardFunction(torch.autograd.Function):
         unsharded_param_grads, inp_grads = grads[: len(fsdp_params_with_grads)], grads[len(fsdp_params_with_grads) :]
         # it's required that all (unsharded) params which require grad receive a gradient
         for fsdp_param, unsharded_param_grad in zip(fsdp_params_with_grads, unsharded_param_grads, strict=True):
+            if unsharded_param_grad is None:
+                raise ValueError(
+                    f"{fsdp_param._param_fqn} requires grad, got unsharded during forward"
+                    ", but got no gradient after backward."
+                )
             if fsdp_param._unsharded_param.grad is None:
                 fsdp_param._unsharded_param_grad.copy_(unsharded_param_grad)
                 fsdp_param._unsharded_param.grad = fsdp_param._unsharded_param_grad
