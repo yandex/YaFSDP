@@ -146,7 +146,7 @@ class YaFSDPState(_State):
                 continue
             self._state_ctx.all_states.append(state)
         assert len(visited_states) == len(self._state_ctx.all_states)
-        if self._fsdp_param_group and self._state_ctx.all_states > 1:
+        if self._fsdp_param_group and len(self._state_ctx.all_states) > 1:
             raise RuntimeError("YaFSDP requires root module to be the only sharded module or to have no parameters.")
         self._init_fqns()
         self._init_shared_state(num_data_buffers, num_grad_buffers, meta_grad_buffers, yccl_handle)
