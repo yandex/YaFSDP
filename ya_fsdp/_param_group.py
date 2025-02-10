@@ -54,7 +54,7 @@ class YaFSDPCommContext:
         self.post_forward_order: List[YaFSDPParamGroup] = []  # will cause ref cycles
         self.yccl_handle: Optional["yccl.Handle"] = yccl_handle
 
-    def get_all_gather_stream(self, training_state: TrainingState) -> Tuple[torch.Stream, torch.Stream]:
+    def get_all_gather_stream(self, training_state: TrainingState) -> torch.Stream:
         if training_state in (TrainingState.FORWARD, TrainingState.PRE_BACKWARD):
             return self.all_gather_stream
         current_stream = self.device_handle.current_stream()
