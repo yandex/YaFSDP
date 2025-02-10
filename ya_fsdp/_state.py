@@ -174,7 +174,8 @@ class YaFSDPState(_State):
             state._fsdp_param_group for state in self._state_ctx.all_states if state._fsdp_param_group is not None
         ]
 
-        buffer_size = max(param_group._padded_unsharded_data_size for param_group in param_groups)
+        data_buffer_ctx2ctx_using_param_groups = {}
+        grad_buffer_ctx2ctx_using_param_groups = {}
         for index, param_group in enumerate(param_groups):
             if (
                 not param_group._reshard_after_forward
@@ -185,23 +186,34 @@ class YaFSDPState(_State):
                     "YaFSDP with reshard_after_forward requires number of data buffers to be no less than number of"
                     f" parameter groups, but got {num_data_buffers=}"
                 )
-            if index < num_data_buffers:
-                param_group._data_buffer_ctx.lazy_init(
-                    buffer_size,
-                    self._mp_policy.param_dtype,
-                    self._device,
-                    yccl_handle=yccl_handle.add_all_gather_output_buffer if yccl_handle is not None else None,
-                )
-            if index < num_grad_buffers:
-                param_group._grad_buffer_ctx.lazy_init(
-                    buffer_size,
-                    self._mp_policy.param_dtype,
-                    self._device if not meta_grad_buffers else torch.device("meta"),
-                    yccl_handle=yccl_handle.add_reduce_scatter_buffer if yccl_handle is not None else None,
-                )
-            param_group._data_buffer_ctx = param_groups[index % num_data_buffers]._data_buffer_ctx
-            param_group._grad_buffer_ctx = param_groups[index % num_grad_buffers]._grad_buffer_ctx
+            data_buffer_ctx2ctx_using_param_groups.setdefault(
+                param_groups[index % num_data_buffers]._data_buffer_ctx, []
+            ).append(param_group)
+            grad_buffer_ctx2ctx_using_param_groups.setdefault(
+                param_groups[index % num_grad_buffers]._grad_buffer_ctx, []
+            ).append(param_group)
+        for data_buffer_ctx, ctx_using_param_groups in data_buffer_ctx2ctx_using_param_groups.items():
+            buffer_size = max(param_group._padded_unsharded_data_size for param_group in ctx_using_param_groups)
+            data_buffer_ctx.lazy_init(
+                buffer_size,
+                self._mp_policy.param_dtype,
+                self._device,
+                yccl_handle=yccl_handle.add_all_gather_output_buffer if yccl_handle is not None else None,
+            )
+            for param_group in ctx_using_param_groups:
+                param_group._data_buffer_ctx = data_buffer_ctx
+        for grad_buffer_ctx, ctx_using_param_groups in grad_buffer_ctx2ctx_using_param_groups.items():
+            buffer_size = max(param_group._padded_unsharded_data_size for param_group in ctx_using_param_groups)
+            grad_buffer_ctx.lazy_init(
+                buffer_size,
+                self._mp_policy.param_dtype,
+                self._device if not meta_grad_buffers else torch.device("meta"),
+                yccl_handle=yccl_handle.add_reduce_scatter_buffer if yccl_handle is not None else None,
+            )
+            for param_group in ctx_using_param_groups:
+                param_group._grad_buffer_ctx = grad_buffer_ctx
 
+        buffer_size = max(param_group._padded_unsharded_data_size for param_group in param_groups)
         if self._mp_policy.reduce_dtype is not None:
             for index, param_group in enumerate(param_groups):
                 if index == 0:

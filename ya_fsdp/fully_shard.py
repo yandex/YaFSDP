@@ -110,6 +110,7 @@ def fully_shard(
             dct = {"__deepcopy__": unimplemented_deepcopy}
             new_cls = type(f"YaFSDP{cls.__name__}", (YaFSDPModule, cls), dct)
             cls_to_fsdp_cls[cls] = new_cls
+            new_cls._version = 2
         module.__class__ = new_cls
     return arg_module
 

@@ -50,7 +50,7 @@ class YaFSDPCommContext:
         self.all_gather_stream = self.device_handle.Stream(priority=high_priority)
         # Reduce-scatter stream gives separate execution "thread" for post-
         # backward logic like pre/post-gradient division and reduce-scatter
-        self.reduce_scatter_stream = self.device_handle.Stream(priority=high_priority)
+        self.reduce_scatter_stream = self.all_gather_stream
         self.post_forward_order: List[YaFSDPParamGroup] = []  # will cause ref cycles
         self.yccl_handle: Optional["yccl.Handle"] = yccl_handle
 
@@ -579,10 +579,16 @@ class YaFSDPParamGroup:
             }
             _state_dict_pre_hook_fn[self._state_dict_type](*args, **kwargs)
 
-        def load_state_dict_pre_hook(module: nn.Module, state_dict: Dict[str, Any], *args: Any) -> None:
+        def load_state_dict_pre_hook(
+            module: nn.Module,
+            state_dict: Dict[str, Any],
+            prefix: str,
+            local_metadata: Dict[str, Any],
+            *args: Any,
+        ) -> None:
             if self._state_dict_type == StateDictType.FULL_STATE_DICT:
                 raise ValueError("Full state dict loading is not implemented.")
-            if (version := state_dict.pop("version", None)) != "2":
+            if (version := local_metadata.get("version")) != 2:
                 raise ValueError(f"Unsupported state dict version: {version}")
             self._to_sharded()
 
@@ -625,9 +631,6 @@ class YaFSDPParamGroup:
             )
             self.reshard()
 
-        def add_ckpt_version_hook(module: nn.Module, state_dict: Dict[str, Any], *args: Any) -> None:
-            state_dict["version"] = "2"
-
         def state_dict_post_hook(module: nn.Module, state_dict: Dict[str, Any], *args: Any) -> None:
             if self._state_dict_type is StateDictType.FULL_STATE_DICT and self._state_dict_config.rank0_only:
                 rank0_only_hook(module, state_dict, *args)
@@ -637,14 +640,12 @@ class YaFSDPParamGroup:
                 offload_to_cpu_hook(module, state_dict, *args)
             if self._state_dict_type is StateDictType.FULL_STATE_DICT:
                 reshard_hook(module, state_dict, *args)
-            if self._state_dict_type is StateDictType.SHARDED_STATE_DICT:
-                add_ckpt_version_hook(module, state_dict, *args)
 
         for module in self.modules:
             self._module_to_pre_save_state_dict_hook_handle[module] = module.register_state_dict_pre_hook(
                 state_dict_pre_hook
             )
-            self._module_to_pre_load_state_dict_hook_handle[module] = module._register_load_state_dict_pre_hook(
+            self._module_to_pre_load_state_dict_hook_handle[module] = module.register_load_state_dict_pre_hook(
                 load_state_dict_pre_hook
             )
             module._register_state_dict_hook(state_dict_post_hook)

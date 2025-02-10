@@ -10,7 +10,7 @@ class MixedPrecisionPolicy:
     param_dtype: Optional[torch.dtype] = None
     reduce_dtype: Optional[torch.dtype] = None
     output_dtype: Optional[torch.dtype] = None
-    cast_forward_inputs: bool = True
+    cast_forward_inputs: bool = False
     bit32_acc_for_bit16_reduce_scatter: bool = False
 
     def __post_init__(self):
