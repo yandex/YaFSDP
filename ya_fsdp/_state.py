@@ -135,7 +135,7 @@ class YaFSDPState(_State):
                 if state not in visited_states and state._is_root is not None:
                     raise RuntimeError(
                         "YaFSDP state has already been lazily initialized for "
-                        f"{module_name}\nFSDP requires running forward through "
+                        f"{module_name}\nYaFSDP requires running forward through "
                         "the root module first"
                     )
                 state._is_root = False
@@ -174,18 +174,26 @@ class YaFSDPState(_State):
             state._fsdp_param_group for state in self._state_ctx.all_states if state._fsdp_param_group is not None
         ]
 
+        if num_data_buffers < (
+            num_param_groups_with_no_reshard_after_forward := sum(
+                not param_group._reshard_after_forward for param_group in param_groups
+            )
+        ):
+            raise ValueError(
+                "YaFSDP with no reshard_after_forward requires number of data buffers to be no less than number of"
+                " parameter groups with no reshard_after_forward, but got"
+                f" {num_data_buffers=} {num_param_groups_with_no_reshard_after_forward=}"
+            )
+
+        if num_data_buffers < min(2, num_param_groups := len(param_groups)):
+            raise ValueError(
+                "num_data_buffers must be no less than min(2, num_param_groups)"
+                f" for correct overlap, but got {num_data_buffers=} {num_param_groups=}."
+            )
+
         data_buffer_ctx2ctx_using_param_groups = {}
         grad_buffer_ctx2ctx_using_param_groups = {}
         for index, param_group in enumerate(param_groups):
-            if (
-                not param_group._reshard_after_forward
-                and param_group not in param_groups[-2:]
-                and num_data_buffers < len(param_groups)
-            ):
-                raise ValueError(
-                    "YaFSDP with reshard_after_forward requires number of data buffers to be no less than number of"
-                    f" parameter groups, but got {num_data_buffers=}"
-                )
             data_buffer_ctx2ctx_using_param_groups.setdefault(
                 param_groups[index % num_data_buffers]._data_buffer_ctx, []
             ).append(param_group)
