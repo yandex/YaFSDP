@@ -193,6 +193,7 @@ class YaFSDPState(_State):
 
         data_buffer_ctx2ctx_using_param_groups = {}
         grad_buffer_ctx2ctx_using_param_groups = {}
+        reduce_dtype_grad_buffer_ctx2ctx_using_param_groups = {}
         for index, param_group in enumerate(param_groups):
             data_buffer_ctx2ctx_using_param_groups.setdefault(
                 param_groups[index % num_data_buffers]._data_buffer_ctx, []
@@ -200,6 +201,10 @@ class YaFSDPState(_State):
             grad_buffer_ctx2ctx_using_param_groups.setdefault(
                 param_groups[index % num_grad_buffers]._grad_buffer_ctx, []
             ).append(param_group)
+            if param_group._reduce_dtype_grad_buffer_ctx is not None:
+                reduce_dtype_grad_buffer_ctx2ctx_using_param_groups.setdefault(
+                    param_groups[0]._reduce_dtype_grad_buffer_ctx, []
+                ).append(param_group)
         for data_buffer_ctx, ctx_using_param_groups in data_buffer_ctx2ctx_using_param_groups.items():
             buffer_size = max(param_group._padded_unsharded_data_size for param_group in ctx_using_param_groups)
             data_buffer_ctx.lazy_init(
@@ -220,15 +225,18 @@ class YaFSDPState(_State):
             )
             for param_group in ctx_using_param_groups:
                 param_group._grad_buffer_ctx = grad_buffer_ctx
-
-        buffer_size = max(param_group._padded_unsharded_data_size for param_group in param_groups)
-        if self._mp_policy.reduce_dtype is not None:
-            for index, param_group in enumerate(param_groups):
-                if index == 0:
-                    param_group._reduce_dtype_grad_buffer_ctx.lazy_init(
-                        buffer_size, self._mp_policy.reduce_dtype, self._device
-                    )
-                param_group._reduce_dtype_grad_buffer_ctx = param_groups[0]._reduce_dtype_grad_buffer_ctx
+        for (
+            reduce_dtype_grad_buffer_ctx,
+            ctx_using_param_groups,
+        ) in reduce_dtype_grad_buffer_ctx2ctx_using_param_groups.items():
+            buffer_size = max(param_group._padded_unsharded_data_size for param_group in ctx_using_param_groups)
+            reduce_dtype_grad_buffer_ctx.lazy_init(
+                buffer_size,
+                self._mp_policy.reduce_dtype,
+                self._device if not meta_grad_buffers else torch.device("meta"),
+            )
+            for param_group in ctx_using_param_groups:
+                param_group._reduce_dtype_grad_buffer_ctx = reduce_dtype_grad_buffer_ctx
 
     def _init_fqns(self) -> None:
         """Sets module and parameter FQN attributes for debugging."""

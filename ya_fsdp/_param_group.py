@@ -85,70 +85,18 @@ class YaFSDPParamGroup:
     ):
         self.modules = modules  # permit ref cycle because 1:1 lifetime
         param_module_infos = _get_param_module_infos(params, modules)
-
-        self.mesh_info = mesh_info
-        self.post_forward_mesh_info = post_forward_mesh_info
-
-        self._init_orig_dtype(params)
-
-        unsharded_data = torch.cat([param.data.view(-1) for param in params])
-        unsharded_data_indices = torch.cat(
-            [torch.full((param.numel(),), i, device=device) for i, param in enumerate(params)]
-        )
-
-        shard_world_size = self.mesh_info.shard_mesh_size
-
-        padded_unsharded_data_size = unsharded_data.numel()
-        divider = shard_world_size * 8
-        if padded_unsharded_data_size % divider != 0:
-            padded_unsharded_data_size += divider - padded_unsharded_data_size % divider
-        self._padded_unsharded_data_size = padded_unsharded_data_size
-
-        padded_unsharded_data = unsharded_data.new_empty(padded_unsharded_data_size)
-        padded_unsharded_data[: unsharded_data.numel()].copy_(unsharded_data)
-
-        padded_unsharded_data_indices = torch.full_like(padded_unsharded_data, fill_value=-1, dtype=torch.int64)
-        padded_unsharded_data_indices[: unsharded_data_indices.numel()].copy_(unsharded_data_indices)
-
-        unsharded_data_numels = [unsharded_data_indices.eq(index).sum().item() for index, _ in enumerate(params)]
-        self._unsharded_data_offsets = [0, *torch.cumsum(torch.tensor(unsharded_data_numels[:-1]), 0).tolist()]
-
-        shard_rank = self.mesh_info.shard_mesh_rank
-
-        padded_sharded_data = torch.chunk(padded_unsharded_data, shard_world_size)[shard_rank].clone()
-        padded_sharded_grad = torch.empty_like(padded_sharded_data)
-
-        padded_sharded_data_indices = torch.chunk(padded_unsharded_data_indices, shard_world_size)[shard_rank]
-
-        sharded_data_numels = [padded_sharded_data_indices.eq(index).sum().item() for index, _ in enumerate(params)]
-        sharded_data_offsets = [0, *torch.cumsum(torch.tensor(sharded_data_numels[:-1]), 0).tolist()]
-
-        self._padded_sharded_param_data = padded_sharded_data
-        self._padded_sharded_param_data_param_dtype = padded_sharded_data.to(mp_policy.param_dtype)
-        self._padded_sharded_param_grad = padded_sharded_grad
-
-        sharded_params = [
-            nn.Parameter(padded_sharded_data.narrow(0, offset, numel), requires_grad=param.requires_grad)
-            for param, offset, numel in zip(params, sharded_data_offsets, sharded_data_numels)
-        ]
-        sharded_param_grads = [
-            padded_sharded_grad.narrow(0, offset, numel)
-            for offset, numel in zip(sharded_data_offsets, sharded_data_numels)
-        ]
-
         self.fsdp_params = [
             YaFSDPParam(
                 param,
-                sharded_param,
-                sharded_param_grad,
                 module_info,
+                mesh_info,
+                post_forward_mesh_info,
                 device,
             )
-            for param, module_info, sharded_param, sharded_param_grad, in zip(
-                params, param_module_infos, sharded_params, sharded_param_grads
-            )
+            for param, module_info in zip(params, param_module_infos)
         ]
-
+        self.mesh_info = mesh_info
+        self.post_forward_mesh_info = post_forward_mesh_info
         self.device = device
         self.device_handle = _get_device_handle(device.type)
         self.mp_policy = mp_policy
@@ -183,16 +131,62 @@ class YaFSDPParamGroup:
 
         self._data_buffer_ctx = YaFSDPBufferContext()
         self._grad_buffer_ctx = YaFSDPBufferContext()
-        self._reduce_dtype_grad_buffer_ctx = YaFSDPBufferContext() if mp_policy.reduce_dtype else None
-
         self._state_dict_type: StateDictType = StateDictType.SHARDED_STATE_DICT
         self._state_dict_config: StateDictConfig = ShardedStateDictConfig()
 
-    def _init_orig_dtype(self, params: list[nn.Parameter]) -> None:
-        orig_dtypes = {param.dtype for param in params}
-        if len(orig_dtypes) != 1:
-            raise AssertionError(f"YaFSDP expects uniform original parameter dtype but got {orig_dtypes}")
-        self._orig_dtype = next(iter(orig_dtypes))
+        self._init_mp_dtypes()
+        self._reduce_dtype_grad_buffer_ctx = YaFSDPBufferContext() if self._reduce_dtype is not None else None
+
+        unsharded_data = torch.cat([fsdp_param.param_data.view(-1) for fsdp_param in self.fsdp_params])
+        unsharded_data_indices = torch.cat(
+            [
+                torch.full((fsdp_param.param_data.numel(),), i, device=device)
+                for i, fsdp_param in enumerate(self.fsdp_params)
+            ]
+        )
+
+        shard_world_size = self.mesh_info.shard_mesh_size
+
+        padded_unsharded_data_size = unsharded_data.numel()
+        divider = shard_world_size * 8
+        if padded_unsharded_data_size % divider != 0:
+            padded_unsharded_data_size += divider - padded_unsharded_data_size % divider
+        self._padded_unsharded_data_size = padded_unsharded_data_size
+
+        padded_unsharded_data = unsharded_data.new_empty(padded_unsharded_data_size)
+        padded_unsharded_data[: unsharded_data.numel()].copy_(unsharded_data)
+
+        padded_unsharded_data_indices = torch.full_like(padded_unsharded_data, fill_value=-1, dtype=torch.int64)
+        padded_unsharded_data_indices[: unsharded_data_indices.numel()].copy_(unsharded_data_indices)
+
+        unsharded_data_numels = [
+            unsharded_data_indices.eq(index).sum().item() for index, _ in enumerate(self.fsdp_params)
+        ]
+        self._unsharded_data_offsets = [0, *torch.cumsum(torch.tensor(unsharded_data_numels[:-1]), 0).tolist()]
+
+        shard_rank = self.mesh_info.shard_mesh_rank
+
+        padded_sharded_data = torch.chunk(padded_unsharded_data, shard_world_size)[shard_rank].clone()
+        padded_sharded_grad = torch.empty_like(padded_sharded_data)
+
+        padded_sharded_data_indices = torch.chunk(padded_unsharded_data_indices, shard_world_size)[shard_rank]
+
+        sharded_data_numels = [
+            padded_sharded_data_indices.eq(index).sum().item() for index, _ in enumerate(self.fsdp_params)
+        ]
+        sharded_data_offsets = [0, *torch.cumsum(torch.tensor(sharded_data_numels[:-1]), 0).tolist()]
+
+        self._padded_sharded_param_data = padded_sharded_data
+        self._padded_sharded_param_data_param_dtype = (
+            padded_sharded_data.to(self._param_dtype) if self._param_dtype is not None else None
+        )
+        self._padded_sharded_param_grad = padded_sharded_grad
+
+        for fsdp_param, offset, numel in zip(self.fsdp_params, sharded_data_offsets, sharded_data_numels):
+            fsdp_param.init_sharded_param(
+                padded_sharded_data.narrow(0, offset, numel),
+                padded_sharded_grad.narrow(0, offset, numel),
+            )
 
     # Initialization #
     def _init_unsharded_params(self):
@@ -202,15 +196,31 @@ class YaFSDPParamGroup:
         self._unsharded_param_data = padded_unsharded_data
         self._unsharded_param_grad = padded_unsharded_grad
 
-        if self.mp_policy.reduce_dtype is not None:
-            self._unsharded_param_grad_reduce_dtype = self._reduce_dtype_grad_buffer_ctx.buffer.narrow(
-                0, 0, self._padded_unsharded_data_size
-            )
-        else:
-            self._unsharded_param_grad_reduce_dtype = None
+        self._unsharded_param_grad_reduce_dtype = (
+            self._reduce_dtype_grad_buffer_ctx.buffer.narrow(0, 0, self._padded_unsharded_data_size)
+            if self._reduce_dtype is not None
+            else None
+        )
 
         for fsdp_param, offset in zip(self.fsdp_params, self._unsharded_data_offsets):
             fsdp_param.init_unsharded_param(padded_unsharded_data, padded_unsharded_grad, offset)
+
+    def _init_mp_dtypes(self) -> None:
+        for fsdp_param in self.fsdp_params:
+            fsdp_param.init_dtype_attrs(self.mp_policy)
+        orig_dtypes = {fsdp_param.orig_dtype for fsdp_param in self.fsdp_params}
+        if len(orig_dtypes) != 1:
+            # This can be relaxed if we copy-out for the reduce-scatter
+            raise AssertionError(f"YaFSDP expects uniform original parameter dtype but got {orig_dtypes}")
+        self._orig_dtype = next(iter(orig_dtypes))
+        param_dtypes = {fsdp_param.param_dtype for fsdp_param in self.fsdp_params}
+        if len(param_dtypes) != 1:
+            raise AssertionError(f"YaFSDP expects uniform param dtype but got {param_dtypes}")
+        self._param_dtype = next(iter(param_dtypes))
+        reduce_dtypes = {fsdp_param.reduce_dtype for fsdp_param in self.fsdp_params}
+        if len(reduce_dtypes) != 1:
+            raise AssertionError(f"YaFSDP expects uniform reduce dtype but got {reduce_dtypes}")
+        self._reduce_dtype = next(iter(reduce_dtypes))
 
     def lazy_init(self):
         # Lazy init should be idempotent
@@ -220,7 +230,7 @@ class YaFSDPParamGroup:
         self._register_state_dict_hooks()
         self._init_unsharded_params()
         if (yccl_handle := self.comm_ctx.yccl_handle) is not None:
-            if self.mp_policy.reduce_dtype is not None:
+            if self._reduce_dtype is not None:
                 raise NotImplementedError("YCCL requires param_dtype and reduce_dtype to be the same.")
             self._padded_sharded_param_data_param_dtype = yccl_handle.add_all_gather_input_buffer(
                 self._padded_sharded_param_data_param_dtype.numel()
@@ -248,20 +258,20 @@ class YaFSDPParamGroup:
         self._data_buffer_ctx.owner = self
         with record_function(self._with_fqn("YaFSDP::all_gather")):
             with self.device_handle.stream(all_gather_stream):
-                if (
-                    self.mp_policy.param_dtype != self._orig_dtype
-                    and self._training_state == TrainingState.FORWARD
-                    and not self._is_sharded_param_grad_set()
-                ):
-                    self._padded_sharded_param_data_param_dtype.copy_(self._padded_sharded_param_data)
+                if self._param_dtype is not None:
+                    input_tensor = self._padded_sharded_param_data_param_dtype
+                    if self._training_state == TrainingState.FORWARD and not self._is_sharded_param_grad_set():
+                        input_tensor.copy_(self._padded_sharded_param_data)
+                else:
+                    input_tensor = self._padded_sharded_param_data
                 if (yccl_handle := self.comm_ctx.yccl_handle) is None:
                     dist.all_gather_into_tensor(
                         output_tensor=self._unsharded_param_data,
-                        input_tensor=self._padded_sharded_param_data_param_dtype,
+                        input_tensor=input_tensor,
                         group=self._all_gather_process_group,
                     )
                 else:
-                    yccl_handle.all_gather(self._padded_sharded_param_data_param_dtype, self._unsharded_param_data)
+                    yccl_handle.all_gather(input_tensor, self._unsharded_param_data)
             self._all_gather_event = all_gather_stream.record_event()
 
     def wait_for_unshard(self):
@@ -355,7 +365,7 @@ class YaFSDPParamGroup:
                 reduce_scatter_stream = self.comm_ctx.reduce_scatter_stream
                 reduce_scatter_stream.wait_stream(self.device_handle.current_stream())
                 with self.device_handle.stream(reduce_scatter_stream):
-                    if self.mp_policy.reduce_dtype is not None:
+                    if self._reduce_dtype is not None:
                         if (owner := self._reduce_dtype_grad_buffer_ctx.owner) is not None:
                             raise RuntimeError(f"Reduce dtype gradient buffer already in use by {owner}")
                         else:
@@ -371,11 +381,10 @@ class YaFSDPParamGroup:
 
                     reduce_in_sharded = (
                         (
-                            self.mp_policy.param_dtype
-                            if self.mp_policy.reduce_dtype is None
-                            else self.mp_policy.reduce_dtype
+                            self._reduce_dtype is None
+                            and self._param_dtype is None
+                            or self._reduce_dtype == self._orig_dtype
                         )
-                        == self._orig_dtype
                         and not self._is_sharded_param_grad_set()
                         and self.comm_ctx.yccl_handle is None
                     )
@@ -401,7 +410,7 @@ class YaFSDPParamGroup:
                         else:
                             self._padded_sharded_param_grad.copy_(output_tensor)
                     release_event = reduce_scatter_stream.record_event()
-                    if self.mp_policy.reduce_dtype is not None:
+                    if self._reduce_dtype is not None:
                         self._reduce_dtype_grad_buffer_ctx.release_event = release_event
                         self._reduce_dtype_grad_buffer_ctx.owner = None
                     else:
@@ -436,7 +445,7 @@ class YaFSDPParamGroup:
             self._post_reduce_event = None
             assert self._grad_buffer_ctx.owner is None
             self._grad_buffer_ctx.release_event = None
-            if self.mp_policy.reduce_dtype is not None:
+            if self._reduce_dtype is not None:
                 assert self._reduce_dtype_grad_buffer_ctx.owner is None
                 self._reduce_dtype_grad_buffer_ctx.release_event = None
 

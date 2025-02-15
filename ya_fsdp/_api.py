@@ -19,12 +19,6 @@ class MixedPrecisionPolicy:
                 "bit32_acc_for_bit16_reduce_scatter can only be used with bfloat16 param and reduce dtypes"
                 f", but got {self.param_dtype=} and {self.reduce_dtype=}."
             )
-        # Clamp `reduce_dtype` to `None` if no casting is required: since
-        # gradients are computed in `param_dtype`, if `reduce_dtype` matches,
-        # then we do not need extra casting
-        if self.param_dtype == self.reduce_dtype:
-            # Bypass the frozen dataclass checks
-            object.__setattr__(self, "reduce_dtype", None)
 
 
 class StateDictType(Enum):

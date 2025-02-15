@@ -3,8 +3,8 @@ from typing import List, Optional, Set, Tuple, Union
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed._tensor import DeviceMesh, init_device_mesh
-from torch.distributed.device_mesh import _get_device_handle
+from torch.distributed.device_mesh import DeviceMesh, _get_device_handle, init_device_mesh
+from torch.distributed.tensor import DTensor
 
 from ._common import FSDPMeshInfo, HSDPMeshInfo
 from ._state import _get_module_fsdp_state
@@ -137,4 +137,9 @@ def _sync_states(
 ):
     states = [*(p.detach() for p in params), *buffers]
     if len(states) > 0:
-        dist._broadcast_coalesced(process_group, states, broadcast_bucket_size, src)
+        dist._broadcast_coalesced(
+            process_group,
+            [state.to_local() if isinstance(state, DTensor) else state for state in states],
+            broadcast_bucket_size,
+            src,
+        )
