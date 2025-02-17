@@ -1,9 +1,11 @@
+import logging
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional, cast
 
 import torch
 import torch.nn as nn
+from torch._logging import warning_once
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 from torch.distributed.tensor.device_mesh import _mesh_resources
@@ -11,6 +13,8 @@ from torch.distributed.tensor.placement_types import Placement, Shard, _StridedS
 
 from ._api import MixedPrecisionPolicy
 from ._common import FSDPMeshInfo, HSDPMeshInfo, TrainingState
+
+logger = logging.getLogger("ya_fsdp")
 
 
 class ShardedState(Enum):
@@ -159,8 +163,9 @@ class YaFSDPParam:
             DTensor(
                 sharded_param,
                 self._sharding_spec,
-                requires_grad=self._requires_grad,
-            )
+                requires_grad=False,
+            ),
+            requires_grad=self._requires_grad,
         )
         self._sharded_param_grad = DTensor(
             sharded_param_grad,
@@ -245,7 +250,7 @@ class YaFSDPParam:
 # CPU overhead, if the module did not override it. For FSDP, we know we do not
 # need those checks when transitioning between sharded/unsharded parameters.
 def unsafe_setattr_param(module: nn.Module, param_name: str, param: nn.Parameter) -> None:
-    if getattr(module.__setattr__, "__func__", None) is nn.Module.__setattr__:
-        module._parameters[param_name] = param
-    else:  # slow path
-        setattr(module, param_name, param)
+    if getattr(module.__setattr__, "__func__", None) is not nn.Module.__setattr__:
+        msg = f"{module.__class__} defines a custom __setattr__ which YaFSDP does not support."
+        warning_once(logger, msg, stacklevel=2)
+    module._parameters[param_name] = param
