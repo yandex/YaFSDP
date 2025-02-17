@@ -249,6 +249,9 @@ class YaFSDPParam:
 # NOTE: These bypass `nn.Module.__setattr__` checks, which incur non-trivial
 # CPU overhead, if the module did not override it. For FSDP, we know we do not
 # need those checks when transitioning between sharded/unsharded parameters.
+# NOTE: With YaFSDP we can't actually use `nn.Module.__setattr__` because
+# unsharded_params have a grad_fn during forward, which is prohibited by
+# `nn.Module.__setattr__` checks.
 def unsafe_setattr_param(module: nn.Module, param_name: str, param: nn.Parameter) -> None:
     if getattr(module.__setattr__, "__func__", None) is not nn.Module.__setattr__:
         msg = f"{module.__class__} defines a custom __setattr__ which YaFSDP does not support."
