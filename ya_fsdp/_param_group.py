@@ -129,13 +129,17 @@ class YaFSDPParamGroup:
         # # different world size, which should be waited on in the next unshard
         # self._reshard_after_forward_event: Optional[torch.Event] = None
 
+        self._init_mp_dtypes()
+        param_group_requires_grad = any(param.requires_grad for param in params)
+
         self._data_buffer_ctx = YaFSDPBufferContext()
-        self._grad_buffer_ctx = YaFSDPBufferContext()
+        self._grad_buffer_ctx = YaFSDPBufferContext() if param_group_requires_grad else None
+        self._reduce_dtype_grad_buffer_ctx = (
+            YaFSDPBufferContext() if param_group_requires_grad and self._reduce_dtype is not None else None
+        )
+
         self._state_dict_type: StateDictType = StateDictType.SHARDED_STATE_DICT
         self._state_dict_config: StateDictConfig = ShardedStateDictConfig()
-
-        self._init_mp_dtypes()
-        self._reduce_dtype_grad_buffer_ctx = YaFSDPBufferContext() if self._reduce_dtype is not None else None
 
         unsharded_data = torch.cat([fsdp_param.param_data.view(-1) for fsdp_param in self.fsdp_params])
         unsharded_data_indices = torch.cat(
@@ -167,7 +171,7 @@ class YaFSDPParamGroup:
         shard_rank = self.mesh_info.shard_mesh_rank
 
         padded_sharded_data = torch.chunk(padded_unsharded_data, shard_world_size)[shard_rank].clone()
-        padded_sharded_grad = torch.empty_like(padded_sharded_data)
+        padded_sharded_grad = torch.empty_like(padded_sharded_data) if param_group_requires_grad else None
 
         padded_sharded_data_indices = torch.chunk(padded_unsharded_data_indices, shard_world_size)[shard_rank]
 
@@ -185,25 +189,25 @@ class YaFSDPParamGroup:
         for fsdp_param, offset, numel in zip(self.fsdp_params, sharded_data_offsets, sharded_data_numels):
             fsdp_param.init_sharded_param(
                 padded_sharded_data.narrow(0, offset, numel),
-                padded_sharded_grad.narrow(0, offset, numel),
+                padded_sharded_grad.narrow(0, offset, numel) if padded_sharded_grad is not None else None,
             )
 
     # Initialization #
     def _init_unsharded_params(self):
-        padded_unsharded_data = self._data_buffer_ctx.buffer.narrow(0, 0, self._padded_unsharded_data_size)
-        padded_unsharded_grad = self._grad_buffer_ctx.buffer.narrow(0, 0, self._padded_unsharded_data_size)
-
-        self._unsharded_param_data = padded_unsharded_data
-        self._unsharded_param_grad = padded_unsharded_grad
-
+        self._unsharded_param_data = self._data_buffer_ctx.buffer.narrow(0, 0, self._padded_unsharded_data_size)
+        self._unsharded_param_grad = (
+            self._grad_buffer_ctx.buffer.narrow(0, 0, self._padded_unsharded_data_size)
+            if self._grad_buffer_ctx is not None
+            else None
+        )
         self._unsharded_param_grad_reduce_dtype = (
             self._reduce_dtype_grad_buffer_ctx.buffer.narrow(0, 0, self._padded_unsharded_data_size)
-            if self._reduce_dtype is not None
+            if self._reduce_dtype_grad_buffer_ctx is not None
             else None
         )
 
         for fsdp_param, offset in zip(self.fsdp_params, self._unsharded_data_offsets):
-            fsdp_param.init_unsharded_param(padded_unsharded_data, padded_unsharded_grad, offset)
+            fsdp_param.init_unsharded_param(self._unsharded_param_data, self._unsharded_param_grad, offset)
 
     def _init_mp_dtypes(self) -> None:
         for fsdp_param in self.fsdp_params:

@@ -157,7 +157,7 @@ class YaFSDPParam:
     def init_sharded_param(
         self,
         sharded_param: nn.Parameter,
-        sharded_param_grad: torch.Tensor,
+        sharded_param_grad: Optional[torch.Tensor],
     ):
         self.sharded_param = nn.Parameter(
             DTensor(
@@ -167,11 +167,13 @@ class YaFSDPParam:
             ),
             requires_grad=self._requires_grad,
         )
-        self._sharded_param_grad = DTensor(
-            sharded_param_grad,
-            self._sharding_spec,
-            requires_grad=False,
-        )
+        if self._requires_grad:
+            assert sharded_param_grad is not None
+            self._sharded_param_grad = DTensor(
+                sharded_param_grad,
+                self._sharding_spec,
+                requires_grad=False,
+            )
         del self.param_data
 
         self._setattr_on_modules(self.sharded_param)
@@ -197,7 +199,7 @@ class YaFSDPParam:
 
     @torch.no_grad()
     def init_unsharded_param(
-        self, padded_unsharded_data: torch.Tensor, padded_unsharded_grad: torch.Tensor, offset: int
+        self, padded_unsharded_data: torch.Tensor, padded_unsharded_grad: Optional[torch.Tensor], offset: int
     ):
         unsharded_param = padded_unsharded_data.narrow(0, offset, self._orig_numel).view(self._orig_size)
         if self.is_dtensor:
@@ -207,6 +209,7 @@ class YaFSDPParam:
             requires_grad=self.sharded_param.requires_grad,
         )
         if self.sharded_param.requires_grad:
+            assert padded_unsharded_grad is not None
             unsharded_param_grad = padded_unsharded_grad.narrow(0, offset, self._orig_numel).view(self._orig_size)
             if self.is_dtensor:
                 unsharded_param_grad = DTensor(unsharded_param_grad, self._tp_spec, requires_grad=False)

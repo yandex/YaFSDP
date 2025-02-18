@@ -111,7 +111,6 @@ class YaFSDPState(_State):
         self,
         num_data_buffers: int = 2,
         num_grad_buffers: int = 2,
-        meta_grad_buffers: bool = False,
         yccl_handle: Optional["yccl.Handle"] = None,
     ) -> None:
         """
@@ -149,7 +148,7 @@ class YaFSDPState(_State):
         if self._fsdp_param_group and len(self._state_ctx.all_states) > 1:
             raise RuntimeError("YaFSDP requires root module to be the only sharded module or to have no parameters.")
         self._init_fqns()
-        self._init_shared_state(num_data_buffers, num_grad_buffers, meta_grad_buffers, yccl_handle)
+        self._init_shared_state(num_data_buffers, num_grad_buffers, yccl_handle)
         # Run parameter group lazy inits after initializing FQNs for improved
         # error messages
         for state in self._state_ctx.all_states:
@@ -160,7 +159,6 @@ class YaFSDPState(_State):
         self,
         num_data_buffers: int,
         num_grad_buffers: int,
-        meta_grad_buffers: bool,
         yccl_handle: Optional["yccl.Handle"],
     ) -> None:
         self._comm_ctx.lazy_init(self._device, yccl_handle)
@@ -192,19 +190,28 @@ class YaFSDPState(_State):
             )
 
         data_buffer_ctx2ctx_using_param_groups = {}
-        grad_buffer_ctx2ctx_using_param_groups = {}
-        reduce_dtype_grad_buffer_ctx2ctx_using_param_groups = {}
         for index, param_group in enumerate(param_groups):
             data_buffer_ctx2ctx_using_param_groups.setdefault(
                 param_groups[index % num_data_buffers]._data_buffer_ctx, []
             ).append(param_group)
+        grad_buffer_ctx2ctx_using_param_groups = {}
+        for index, param_group in enumerate(
+            param_groups_with_ctx := [
+                param_group for param_group in param_groups if param_group._grad_buffer_ctx is not None
+            ]
+        ):
             grad_buffer_ctx2ctx_using_param_groups.setdefault(
-                param_groups[index % num_grad_buffers]._grad_buffer_ctx, []
+                param_groups_with_ctx[index % num_grad_buffers]._grad_buffer_ctx, []
             ).append(param_group)
-            if param_group._reduce_dtype_grad_buffer_ctx is not None:
-                reduce_dtype_grad_buffer_ctx2ctx_using_param_groups.setdefault(
-                    param_groups[0]._reduce_dtype_grad_buffer_ctx, []
-                ).append(param_group)
+        reduce_dtype_grad_buffer_ctx2ctx_using_param_groups = {}
+        for index, param_group in enumerate(
+            param_groups_with_ctx := [
+                param_group for param_group in param_groups if param_group._reduce_dtype_grad_buffer_ctx is not None
+            ]
+        ):
+            reduce_dtype_grad_buffer_ctx2ctx_using_param_groups.setdefault(
+                param_groups_with_ctx[0]._reduce_dtype_grad_buffer_ctx, []
+            ).append(param_group)
         for data_buffer_ctx, ctx_using_param_groups in data_buffer_ctx2ctx_using_param_groups.items():
             buffer_size = max(param_group._padded_unsharded_data_size for param_group in ctx_using_param_groups)
             data_buffer_ctx.lazy_init(
@@ -220,7 +227,7 @@ class YaFSDPState(_State):
             grad_buffer_ctx.lazy_init(
                 buffer_size,
                 self._mp_policy.param_dtype,
-                self._device if not meta_grad_buffers else torch.device("meta"),
+                self._device,
                 yccl_handle=yccl_handle.add_reduce_scatter_buffer if yccl_handle is not None else None,
             )
             for param_group in ctx_using_param_groups:
@@ -233,7 +240,7 @@ class YaFSDPState(_State):
             reduce_dtype_grad_buffer_ctx.lazy_init(
                 buffer_size,
                 self._mp_policy.reduce_dtype,
-                self._device if not meta_grad_buffers else torch.device("meta"),
+                self._device,
             )
             for param_group in ctx_using_param_groups:
                 param_group._reduce_dtype_grad_buffer_ctx = reduce_dtype_grad_buffer_ctx
