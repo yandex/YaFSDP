@@ -436,7 +436,7 @@ class YaFSDPParamGroup:
         grad_is_set = any(
             fsdp_param.sharded_param.grad is not None
             for fsdp_param in self.fsdp_params
-            if fsdp_param.sharded_param.requires_grad and fsdp_param.sharded_param.numel() != 0
+            if fsdp_param.sharded_param.requires_grad
         )
         return grad_is_set
 
