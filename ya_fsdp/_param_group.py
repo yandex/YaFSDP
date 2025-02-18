@@ -335,13 +335,14 @@ class YaFSDPParamGroup:
             self._training_state = TrainingState.PRE_BACKWARD
             self.unshard()
             self.wait_for_unshard()
+        if self._grad_buffer_ctx is None:
+            return
         if (owner := self._grad_buffer_ctx.owner) is not None and owner != self:
             raise RuntimeError(f"{self} tried to acquire its gradient buffer, but it is in use by {owner}")
-        else:
-            if (release_event := self._grad_buffer_ctx.release_event) is not None:
-                self.device_handle.current_stream().wait_event(release_event)
-                self._grad_buffer_ctx.release_event = None
-            self._grad_buffer_ctx.owner = self
+        if (release_event := self._grad_buffer_ctx.release_event) is not None:
+            self.device_handle.current_stream().wait_event(release_event)
+            self._grad_buffer_ctx.release_event = None
+        self._grad_buffer_ctx.owner = self
 
     def post_backward(self, *unused: Any):
         # This method should be idempotent and safe to call even when this
@@ -364,6 +365,9 @@ class YaFSDPParamGroup:
             # we prefetch here and not in pre_backward to avoid prefetching a layer into
             # the same buffer the layer we're performing backward on is using
             self._backward_prefetch()
+        if self._grad_buffer_ctx is None:
+            assert len(fsdp_params_with_grad) == 0
+            return
         if len(fsdp_params_with_grad) != 0:
             with record_function(self._with_fqn("YaFSDP::post_backward_reduce")):
                 reduce_scatter_stream = self.comm_ctx.reduce_scatter_stream
