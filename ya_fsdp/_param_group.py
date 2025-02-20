@@ -12,6 +12,7 @@ from torch.utils._pytree import tree_flatten, tree_unflatten
 from torch.utils.hooks import RemovableHandle
 
 from ._api import MixedPrecisionPolicy, ShardedStateDictConfig, StateDictConfig, StateDictType
+from ._collectives import all_gather, reduce_scatter
 from ._common import FSDPMeshInfo, TrainingState
 from ._param import ParamModuleInfo, ShardedState, YaFSDPParam
 
@@ -100,7 +101,7 @@ class YaFSDPParamGroup:
         self.device = device
         self.device_handle = _get_device_handle(device.type)
         self.mp_policy = mp_policy
-        self._training_state = TrainingState.IDLE
+        self.training_state = TrainingState.IDLE
         # Group's sharded state always matches its parameters' sharded states
         self._sharded_state = ShardedState.SHARDED
         self._module_fqn: Optional[str] = None  # prefixed from root module
@@ -246,37 +247,26 @@ class YaFSDPParamGroup:
             return
         if self.is_unsharded:
             return  # no-op
-        if not self.unshard_in_backward and self._training_state == TrainingState.PRE_BACKWARD:
+        if not self.unshard_in_backward and self.training_state == TrainingState.PRE_BACKWARD:
             return
         # if self._reshard_after_forward_event is not None:
         #     # Resharded parameter data is allocated in the default stream and
         #     # used in the all-gather streams
         #     self._wait_all_gather_stream_on_event(self._reshard_after_forward_event)
         #     self._reshard_after_forward_event = None
-        all_gather_stream = self.comm_ctx.get_all_gather_stream(self._training_state)
-        if self._data_buffer_ctx.owner is not None:
-            self._data_buffer_ctx.owner.reshard()
-        if (release_event := self._data_buffer_ctx.release_event) is not None:
-            all_gather_stream.wait_event(release_event)
-            self._data_buffer_ctx.release_event = None
-        self._data_buffer_ctx.owner = self
         with record_function(self._with_fqn("YaFSDP::all_gather")):
-            with self.device_handle.stream(all_gather_stream):
-                if self._param_dtype is not None:
-                    input_tensor = self._padded_sharded_param_data_param_dtype
-                    if self._training_state == TrainingState.FORWARD and not self._is_sharded_param_grad_set():
-                        input_tensor.copy_(self._padded_sharded_param_data)
-                else:
-                    input_tensor = self._padded_sharded_param_data
-                if (yccl_handle := self.comm_ctx.yccl_handle) is None:
-                    dist.all_gather_into_tensor(
-                        output_tensor=self._unsharded_param_data,
-                        input_tensor=input_tensor,
-                        group=self._all_gather_process_group,
-                    )
-                else:
-                    yccl_handle.all_gather(input_tensor, self._unsharded_param_data)
-            self._all_gather_event = all_gather_stream.record_event()
+            self._all_gather_event = all_gather(
+                self,
+                self._padded_sharded_param_data,
+                self._padded_sharded_param_data_param_dtype,
+                self._unsharded_param_data,
+                self._data_buffer_ctx,
+                self._all_gather_process_group,
+                self.comm_ctx.get_all_gather_stream(self.training_state),
+                self._param_dtype,
+                self.device_handle,
+                self.comm_ctx.yccl_handle,
+            )
 
     def wait_for_unshard(self):
         if self._all_gather_event:
@@ -285,7 +275,7 @@ class YaFSDPParamGroup:
         self._to_unsharded()
 
     def reshard(self):
-        if self._training_state == TrainingState.FORWARD:
+        if self.training_state == TrainingState.FORWARD:
             if not self._reshard_after_forward:
                 return
             if self._use_post_forward_mesh:
@@ -303,7 +293,7 @@ class YaFSDPParamGroup:
     ) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
         logger.debug("%s", self._with_fqn("YaFSDP::pre_forward"))
         with record_function(self._with_fqn("YaFSDP::pre_forward")):
-            self._training_state = TrainingState.FORWARD
+            self.training_state = TrainingState.FORWARD
             self.unshard()
             args, kwargs, unsharded_params = self._register_post_backward_hook(args, kwargs)
             for fsdp_param, unsharded_param in unsharded_params.items():
@@ -317,7 +307,7 @@ class YaFSDPParamGroup:
             self.reshard()
             if torch.is_grad_enabled():
                 self._record_post_forward()
-            self._training_state = TrainingState.IDLE
+            self.training_state = TrainingState.IDLE
             return output
 
     def _record_post_forward(self) -> None:
@@ -328,11 +318,11 @@ class YaFSDPParamGroup:
         self._post_forward_indices.append(post_forward_index)
 
     def pre_backward(self):
-        if self._training_state == TrainingState.PRE_BACKWARD:
+        if self.training_state == TrainingState.PRE_BACKWARD:
             return
         logger.debug("%s", self._with_fqn("YaFSDP::pre_backward"))
         with record_function(self._with_fqn("YaFSDP::pre_backward")):
-            self._training_state = TrainingState.PRE_BACKWARD
+            self.training_state = TrainingState.PRE_BACKWARD
             self.unshard()
             self.wait_for_unshard()
         if self._grad_buffer_ctx is None:
@@ -348,7 +338,7 @@ class YaFSDPParamGroup:
         # This method should be idempotent and safe to call even when this
         # FSDP parameter group was not used in backward (should be a no-op)
         logger.debug("%s", self._with_fqn("YaFSDP::post_backward"))
-        self._training_state = TrainingState.POST_BACKWARD
+        self.training_state = TrainingState.POST_BACKWARD
         with record_function(self._with_fqn("YaFSDP::post_backward_reshard")):
             if not self.reduce_grads:
                 if self.reshard_after_backward:
@@ -370,69 +360,28 @@ class YaFSDPParamGroup:
             return
         if len(fsdp_params_with_grad) != 0:
             with record_function(self._with_fqn("YaFSDP::post_backward_reduce")):
-                reduce_scatter_stream = self.comm_ctx.reduce_scatter_stream
-                reduce_scatter_stream.wait_stream(self.device_handle.current_stream())
-                with self.device_handle.stream(reduce_scatter_stream):
-                    if self._reduce_dtype is not None:
-                        if (owner := self._reduce_dtype_grad_buffer_ctx.owner) is not None:
-                            raise RuntimeError(f"Reduce dtype gradient buffer already in use by {owner}")
-                        else:
-                            if (release_event := self._reduce_dtype_grad_buffer_ctx.release_event) is not None:
-                                reduce_scatter_stream.wait_event(release_event)
-                                self._reduce_dtype_grad_buffer_ctx.release_event = None
-                            self._reduce_dtype_grad_buffer_ctx.owner = self
-                        self._unsharded_param_grad_reduce_dtype.copy_(self._unsharded_param_grad)
-                        grad_buffer_release_event = reduce_scatter_stream.record_event()
-                        input_tensor = self._unsharded_param_grad_reduce_dtype
-                    else:
-                        input_tensor = self._unsharded_param_grad
-
-                    reduce_in_sharded = (
-                        (
-                            self._reduce_dtype is None
-                            and self._param_dtype is None
-                            or self._reduce_dtype == self._orig_dtype
-                        )
-                        and not self._is_sharded_param_grad_set()
-                        and self.comm_ctx.yccl_handle is None
-                    )
-                    if reduce_in_sharded:
-                        output_tensor = self._padded_sharded_param_grad
-                    else:
-                        output_tensor = input_tensor.chunk(self.mesh_info.shard_mesh_size)[
-                            self.mesh_info.shard_mesh_rank
-                        ]
-                    if (yccl_handle := self.comm_ctx.yccl_handle) is None:
-                        dist.reduce_scatter_tensor(
-                            output_tensor,
-                            input_tensor,
-                            group=self._reduce_scatter_process_group,
-                            **{"acc_type": torch.float32} if self.mp_policy.bit32_acc_for_bit16_reduce_scatter else {},
-                        )
-                    else:
-                        yccl_handle.reduce_scatter(input_tensor)
-                    output_tensor.div_(self.mesh_info.shard_mesh_size)
-                    if not reduce_in_sharded:
-                        if self._is_sharded_param_grad_set():
-                            self._padded_sharded_param_grad.add_(output_tensor)
-                        else:
-                            self._padded_sharded_param_grad.copy_(output_tensor)
-                    release_event = reduce_scatter_stream.record_event()
-                    if self._reduce_dtype is not None:
-                        self._reduce_dtype_grad_buffer_ctx.release_event = release_event
-                        self._reduce_dtype_grad_buffer_ctx.owner = None
-                    else:
-                        grad_buffer_release_event = release_event
-                    for fsdp_param in fsdp_params_with_grad:
-                        fsdp_param.set_sharded_param_grad()
-                self._post_reduce_event = release_event
+                self.post_reduce_event, grad_buffer_release_event = reduce_scatter(
+                    self,
+                    fsdp_params_with_grad,
+                    self._padded_sharded_param_grad,
+                    self._unsharded_param_grad,
+                    self._unsharded_param_grad_reduce_dtype,
+                    self._reduce_dtype_grad_buffer_ctx,
+                    self._reduce_scatter_process_group,
+                    self.comm_ctx.reduce_scatter_stream,
+                    self._orig_dtype,
+                    self._param_dtype,
+                    self._reduce_dtype,
+                    self.device_handle,
+                    self.mp_policy.bit32_acc_for_bit16_reduce_scatter,
+                    self.comm_ctx.yccl_handle,
+                )
         else:
             grad_buffer_release_event = self.device_handle.current_stream().record_event()
-
         self._grad_buffer_ctx.release_event = grad_buffer_release_event
         self._grad_buffer_ctx.owner = None
 
-    def _is_sharded_param_grad_set(self) -> bool:
+    def is_sharded_param_grad_set(self) -> bool:
         grad_is_set = any(
             fsdp_param.sharded_param.grad is not None
             for fsdp_param in self.fsdp_params
@@ -499,7 +448,7 @@ class YaFSDPParamGroup:
 
     def _to_unsharded(self):
         for fsdp_param in self.fsdp_params:
-            fsdp_param.to_unsharded(self._training_state)
+            fsdp_param.to_unsharded(self.training_state)
         if not self.is_unsharded:
             self._sharded_state = ShardedState.UNSHARDED
 
@@ -517,12 +466,12 @@ class YaFSDPParamGroup:
 
     @contextlib.contextmanager
     def use_training_state(self, training_state: TrainingState):
-        old_training_state = self._training_state
-        self._training_state = training_state
+        old_training_state = self.training_state
+        self.training_state = training_state
         try:
             yield
         finally:
-            self._training_state = old_training_state
+            self.training_state = old_training_state
 
     # Hook Registration #
     def _register_post_backward_hook(
