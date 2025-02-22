@@ -142,37 +142,43 @@ class YaFSDPParamGroup:
         self._state_dict_type: StateDictType = StateDictType.SHARDED_STATE_DICT
         self._state_dict_config: StateDictConfig = ShardedStateDictConfig()
 
-        unsharded_data = torch.cat([fsdp_param.param_data.view(-1) for fsdp_param in self.fsdp_params])
-        unsharded_data_indices = torch.cat(
-            [
-                torch.full((fsdp_param.param_data.numel(),), i, device=device)
-                for i, fsdp_param in enumerate(self.fsdp_params)
-            ]
-        )
-
         shard_world_size = self.mesh_info.shard_mesh_size
 
-        padded_unsharded_data_size = unsharded_data.numel()
+        unsharded_data_numels = [fsdp_param.param_data.numel() for fsdp_param in self.fsdp_params]
+        self._unsharded_data_offsets = [0, *torch.cumsum(torch.tensor(unsharded_data_numels[:-1]), 0).tolist()]
+
+        padded_unsharded_data_size = sum(unsharded_data_numels)
         divider = shard_world_size * 8
         if padded_unsharded_data_size % divider != 0:
             padded_unsharded_data_size += divider - padded_unsharded_data_size % divider
         self._padded_unsharded_data_size = padded_unsharded_data_size
 
-        padded_unsharded_data = unsharded_data.new_empty(padded_unsharded_data_size)
-        padded_unsharded_data[: unsharded_data.numel()].copy_(unsharded_data)
+        self._padded_sharded_param_data = torch.empty(
+            padded_unsharded_data_size // shard_world_size, dtype=self._orig_dtype, device=device
+        )
+        self._padded_sharded_param_data_param_dtype = (
+            self._padded_sharded_param_data.to(self._param_dtype) if self._param_dtype is not None else None
+        )
+        self._padded_sharded_param_grad = (
+            torch.empty_like(self._padded_sharded_param_data) if param_group_requires_grad else None
+        )
 
-        padded_unsharded_data_indices = torch.full_like(padded_unsharded_data, fill_value=-1, dtype=torch.int64)
-        padded_unsharded_data_indices[: unsharded_data_indices.numel()].copy_(unsharded_data_indices)
-
-        unsharded_data_numels = [
-            unsharded_data_indices.eq(index).sum().item() for index, _ in enumerate(self.fsdp_params)
-        ]
-        self._unsharded_data_offsets = [0, *torch.cumsum(torch.tensor(unsharded_data_numels[:-1]), 0).tolist()]
+        padded_unsharded_data = torch.empty(padded_unsharded_data_size, dtype=self._orig_dtype, device=device)
+        assert len(self.fsdp_params) < (max_indices_dtype_value := torch.iinfo((indices_dtype := torch.uint16)).max)
+        padded_unsharded_data_indices = torch.full_like(
+            padded_unsharded_data, fill_value=max_indices_dtype_value, dtype=indices_dtype
+        )
+        for i, (fsdp_param, offset, numel) in enumerate(
+            zip(self.fsdp_params, self._unsharded_data_offsets, unsharded_data_numels)
+        ):
+            padded_unsharded_data[offset : offset + numel] = fsdp_param.param_data.view(-1)
+            padded_unsharded_data_indices[offset : offset + numel] = i
 
         shard_rank = self.mesh_info.shard_mesh_rank
 
-        padded_sharded_data = torch.chunk(padded_unsharded_data, shard_world_size)[shard_rank].clone()
-        padded_sharded_grad = torch.empty_like(padded_sharded_data) if param_group_requires_grad else None
+        self._padded_sharded_param_data.copy_(torch.chunk(padded_unsharded_data, shard_world_size)[shard_rank])
+        if self._padded_sharded_param_data_param_dtype is not None:
+            self._padded_sharded_param_data_param_dtype.copy_(self._padded_sharded_param_data)
 
         padded_sharded_data_indices = torch.chunk(padded_unsharded_data_indices, shard_world_size)[shard_rank]
 
@@ -181,16 +187,12 @@ class YaFSDPParamGroup:
         ]
         sharded_data_offsets = [0, *torch.cumsum(torch.tensor(sharded_data_numels[:-1]), 0).tolist()]
 
-        self._padded_sharded_param_data = padded_sharded_data
-        self._padded_sharded_param_data_param_dtype = (
-            padded_sharded_data.to(self._param_dtype) if self._param_dtype is not None else None
-        )
-        self._padded_sharded_param_grad = padded_sharded_grad
-
         for fsdp_param, offset, numel in zip(self.fsdp_params, sharded_data_offsets, sharded_data_numels):
             fsdp_param.init_sharded_param(
-                padded_sharded_data.narrow(0, offset, numel),
-                padded_sharded_grad.narrow(0, offset, numel) if padded_sharded_grad is not None else None,
+                self._padded_sharded_param_data.narrow(0, offset, numel),
+                self._padded_sharded_param_grad.narrow(0, offset, numel)
+                if self._padded_sharded_param_grad is not None
+                else None,
             )
 
     # Initialization #

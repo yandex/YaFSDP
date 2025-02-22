@@ -1,4 +1,3 @@
-import gc
 import logging
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -176,7 +175,6 @@ class YaFSDPParam:
                 requires_grad=False,
             )
         del self.param_data
-        gc.collect()
 
         self._setattr_on_modules(self.sharded_param)
         self.sharded_state = ShardedState.SHARDED
