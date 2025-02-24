@@ -101,6 +101,8 @@ def fully_shard(
             device,
             mp_policy,
         )
+        del params
+        torch.cuda.empty_cache()
 
     # Place YaFSDP leftmost for highest priority in the method resolution order
     for module in modules:

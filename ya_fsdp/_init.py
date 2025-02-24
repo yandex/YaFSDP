@@ -124,8 +124,11 @@ def _move_modules_to_device(
     modules: List[nn.Module],
     device: torch.device,
 ) -> None:
+    prev_overwrite_module_params_on_conversion = torch.__future__.get_overwrite_module_params_on_conversion()
+    torch.__future__.set_overwrite_module_params_on_conversion(True)
     for module in modules:
         module._apply(lambda t: torch.empty_like(t, device=device) if t.is_meta else t.to(device), recurse=False)
+    torch.__future__.set_overwrite_module_params_on_conversion(prev_overwrite_module_params_on_conversion)
 
 
 def _sync_states(
@@ -143,3 +146,4 @@ def _sync_states(
             broadcast_bucket_size,
             src,
         )
+        torch.cuda.empty_cache()
