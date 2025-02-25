@@ -49,7 +49,7 @@ def all_gather(
             )
         else:
             yccl_handle.all_gather(input_tensor, unsharded_param_data)
-        all_gather_event = all_gather_stream.record_event()
+    all_gather_event = all_gather_stream.record_event()
     return all_gather_event
 
 

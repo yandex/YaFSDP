@@ -160,7 +160,7 @@ class YaFSDPParamGroup:
             self._padded_sharded_param_data.to(self._param_dtype) if self._param_dtype is not None else None
         )
         self._padded_sharded_param_grad = (
-            torch.empty_like(self._padded_sharded_param_data) if param_group_requires_grad else None
+            torch.zeros_like(self._padded_sharded_param_data) if param_group_requires_grad else None
         )
 
         padded_unsharded_data = torch.empty(padded_unsharded_data_size, dtype=self._orig_dtype, device=device)
@@ -362,7 +362,7 @@ class YaFSDPParamGroup:
             return
         if len(fsdp_params_with_grad) != 0:
             with record_function(self._with_fqn("YaFSDP::post_backward_reduce")):
-                self.post_reduce_event, grad_buffer_release_event = reduce_scatter(
+                self._post_reduce_event, grad_buffer_release_event = reduce_scatter(
                     self,
                     fsdp_params_with_grad,
                     self._padded_sharded_param_grad,

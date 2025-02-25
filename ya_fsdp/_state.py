@@ -324,7 +324,7 @@ class YaFSDPState(_State):
                     fsdp_param_group.post_backward()
                 state._training_state = TrainingState.IDLE
                 if fsdp_param_group:
-                    fsdp_param_group._training_state = TrainingState.IDLE
+                    fsdp_param_group.training_state = TrainingState.IDLE
                 if self._state_ctx.is_last_backward:
                     state._finalize_backward()
             self._comm_ctx.post_forward_order.clear()
