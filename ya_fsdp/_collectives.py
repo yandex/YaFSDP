@@ -130,7 +130,7 @@ def _get_gradient_divide_factors(
     reduce_scatter_group: dist.ProcessGroup,
     reduce_dtype: torch.dtype,
     yccl_handle: Optional["yccl.Handle"],
-) -> Union[Tuple[None, None], Tuple[float, float]]:
+) -> Union[Tuple[None, None], Tuple[None, float], Tuple[float, float]]:
     # For fp32/bf16, we do not need to worry about overflow/underflow, so we
     # use NCCL's built-in division to avoid separate div kernels
     data_parallel_size = reduce_scatter_group.size()
