@@ -1,7 +1,7 @@
 import logging
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Optional, cast
+from typing import List, Optional, cast
 
 import torch
 import torch.nn as nn
@@ -47,8 +47,8 @@ class ParamModuleInfo:
     # Parameter names are unprefixed, e.g. "weight", not "lin.weight"
     module: nn.Module
     param_name: str
-    shared_modules: list[nn.Module] = field(default_factory=list)
-    shared_param_names: list[str] = field(default_factory=list)
+    shared_modules: List[nn.Module] = field(default_factory=list)
+    shared_param_names: List[str] = field(default_factory=list)
 
 
 class YaFSDPParam:
@@ -59,10 +59,10 @@ class YaFSDPParam:
     _orig_size: torch.Size
     _orig_numel: int
     sharded_param: nn.Parameter
-    _sharded_param_grad: torch.Tensor
+    _sharded_param_grad: Optional[torch.Tensor]
     _unsharded_param: nn.Parameter
-    _unsharded_param_grad: torch.Tensor
-    _unsharded_params_for_backward: list[nn.Parameter]
+    _unsharded_param_grad: Optional[torch.Tensor]
+    _unsharded_params_for_backward: List[nn.Parameter]
 
     def __init__(
         self,
@@ -145,18 +145,13 @@ class YaFSDPParam:
         self.param_data = param_data
         self._requires_grad = param.requires_grad
 
-        self.sharded_param = None
-        self._sharded_param_grad = None
-
-        self._unsharded_param = None
-        self._unsharded_param_grad = None
         self._unsharded_params_for_backward = []
         self._param_fqn: Optional[str] = None  # prefixed from root module
 
     @torch.no_grad()
     def init_sharded_param(
         self,
-        sharded_param: nn.Parameter,
+        sharded_param: torch.Tensor,
         sharded_param_grad: Optional[torch.Tensor],
     ):
         self.sharded_param = nn.Parameter(
@@ -174,6 +169,8 @@ class YaFSDPParam:
                 self._sharding_spec,
                 requires_grad=False,
             )
+        else:
+            self._sharded_param_grad = None
         del self.param_data
 
         self._setattr_on_modules(self.sharded_param)
@@ -214,6 +211,8 @@ class YaFSDPParam:
             if self.is_dtensor:
                 unsharded_param_grad = DTensor(unsharded_param_grad, self._tp_spec, requires_grad=False)
             self._unsharded_param_grad = unsharded_param_grad
+        else:
+            self._unsharded_param_grad = None
 
     def to_sharded(self) -> None:
         self._setattr_on_modules(self.sharded_param)

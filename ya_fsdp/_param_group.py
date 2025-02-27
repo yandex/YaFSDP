@@ -11,7 +11,7 @@ from torch.profiler import record_function
 from torch.utils._pytree import tree_flatten, tree_unflatten
 from torch.utils.hooks import RemovableHandle
 
-from ._api import MixedPrecisionPolicy, ShardedStateDictConfig, StateDictConfig, StateDictType
+from ._api import FullStateDictConfig, MixedPrecisionPolicy, ShardedStateDictConfig, StateDictConfig, StateDictType
 from ._collectives import all_gather, reduce_scatter
 from ._common import FSDPMeshInfo, TrainingState
 from ._param import ParamModuleInfo, ShardedState, YaFSDPParam
@@ -30,7 +30,9 @@ _ModuleToHandleDict = Dict[nn.Module, RemovableHandle]  # for state dict
 class YaFSDPBufferContext:
     """This has the buffer state for all-gather / reduce-scatter ops shared across YaFSDP parameter groups."""
 
-    def lazy_init(self, buffer_size: int, dtype: torch.dtype, device: torch.device, yccl_handle: Callable = None):
+    def lazy_init(
+        self, buffer_size: int, dtype: torch.dtype, device: torch.device, yccl_handle: Optional[Callable] = None
+    ):
         if yccl_handle is not None and dtype != torch.bfloat16:
             raise RuntimeError("YCCL requires param_dtype and reduce_dtype to be bfloat16")
         self.buffer = (
@@ -67,12 +69,12 @@ class YaFSDPParamGroup:
 
     _orig_dtype: torch.dtype
     _padded_unsharded_data_size: int
-    _unsharded_data_offsets: list[int]
+    _unsharded_data_offsets: List[int]
     _padded_sharded_param_data: torch.Tensor
-    _padded_sharded_param_data_param_dtype: torch.Tensor
-    _padded_sharded_param_grad: torch.Tensor
+    _padded_sharded_param_data_param_dtype: Optional[torch.Tensor]
+    _padded_sharded_param_grad: Optional[torch.Tensor]
     _unsharded_param_data: torch.Tensor
-    _unsharded_param_grad: torch.Tensor
+    _unsharded_param_grad: Optional[torch.Tensor]
     _unsharded_param_grad_reduce_dtype: Optional[torch.Tensor]
 
     def __init__(
@@ -183,7 +185,7 @@ class YaFSDPParamGroup:
         padded_sharded_data_indices = torch.chunk(padded_unsharded_data_indices, shard_world_size)[shard_rank]
 
         sharded_data_numels = [
-            padded_sharded_data_indices.eq(index).sum().item() for index, _ in enumerate(self.fsdp_params)
+            cast(int, padded_sharded_data_indices.eq(index).sum().item()) for index, _ in enumerate(self.fsdp_params)
         ]
         sharded_data_offsets = [0, *torch.cumsum(torch.tensor(sharded_data_numels[:-1]), 0).tolist()]
 
@@ -365,8 +367,8 @@ class YaFSDPParamGroup:
                 self._post_reduce_event, grad_buffer_release_event = reduce_scatter(
                     self,
                     fsdp_params_with_grad,
-                    self._padded_sharded_param_grad,
-                    self._unsharded_param_grad,
+                    cast(torch.Tensor, self._padded_sharded_param_grad),
+                    cast(torch.Tensor, self._unsharded_param_grad),
                     self._unsharded_param_grad_reduce_dtype,
                     self._reduce_dtype_grad_buffer_ctx,
                     self._reduce_scatter_process_group,
@@ -480,7 +482,7 @@ class YaFSDPParamGroup:
         self,
         args: Tuple[Any, ...],
         kwargs: Dict[str, Any],
-    ) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
+    ) -> Tuple[Tuple[Any, ...], Dict[str, Any], Dict[YaFSDPParam, nn.Parameter]]:
         if not torch.is_grad_enabled():
             return args, kwargs, {}
         args_list, args_spec = tree_flatten(args)
@@ -504,19 +506,21 @@ class YaFSDPParamGroup:
             inp_tensors[: len(fsdp_params_with_grads)],
             inp_tensors[len(fsdp_params_with_grads) :],
         )
-        unsharded_params = {
-            fsdp_param: unsharded_param
+        for unsharded_param in unsharded_params:
+            unsharded_param._is_param = True
+        fsdp_param2unsharded_param = {
+            fsdp_param: cast(nn.Parameter, unsharded_param)
             for fsdp_param, unsharded_param in zip(fsdp_params_with_grads, unsharded_params, strict=True)
         }
         if len(inp_tensors) == 0:
-            return args, kwargs, unsharded_params  # no tensors that require gradients
+            return args, kwargs, fsdp_param2unsharded_param  # no tensors that require gradients
         for inp_tensor_idx, inp_tensor in zip(inp_tensor_indices, inp_tensors):
             args_kwargs_list[inp_tensor_idx] = inp_tensor
         args_list = args_kwargs_list[: len(args_list)]
         kwargs_list = args_kwargs_list[len(args_list) :]
         args = tree_unflatten(args_list, args_spec)
         kwargs = tree_unflatten(kwargs_list, kwargs_spec)
-        return args, kwargs, unsharded_params
+        return args, kwargs, fsdp_param2unsharded_param
 
     def _register_state_dict_hooks(self) -> None:
         num_pre_save_hooks = len(self._module_to_pre_save_state_dict_hook_handle)
@@ -600,7 +604,10 @@ class YaFSDPParamGroup:
             self.reshard()
 
         def state_dict_post_hook(module: nn.Module, state_dict: Dict[str, Any], *args: Any) -> None:
-            if self._state_dict_type is StateDictType.FULL_STATE_DICT and self._state_dict_config.rank0_only:
+            if (
+                self._state_dict_type is StateDictType.FULL_STATE_DICT
+                and cast(FullStateDictConfig, self._state_dict_config).rank0_only
+            ):
                 rank0_only_hook(module, state_dict, *args)
             if self._state_dict_type is StateDictType.FULL_STATE_DICT:
                 detach_and_clone_hook(module, state_dict, *args)

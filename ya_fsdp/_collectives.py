@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union, cast
 
 import torch
 import torch.distributed as dist
@@ -58,8 +58,8 @@ def reduce_scatter(
     fsdp_params_with_grad: List[YaFSDPParam],
     padded_sharded_param_grad: torch.Tensor,
     unsharded_param_grad: torch.Tensor,
-    unsharded_param_grad_reduce_dtype: torch.Tensor,
-    reduce_dtype_grad_buffer_ctx: "YaFSDPBufferContext",
+    unsharded_param_grad_reduce_dtype: Optional[torch.Tensor],
+    reduce_dtype_grad_buffer_ctx: Optional["YaFSDPBufferContext"],
     reduce_scatter_group: dist.ProcessGroup,
     reduce_scatter_stream: torch.Stream,
     orig_dtype: torch.dtype,
@@ -72,6 +72,8 @@ def reduce_scatter(
     reduce_scatter_stream.wait_stream(device_handle.current_stream())
     with device_handle.stream(reduce_scatter_stream):
         if reduce_dtype is not None:
+            reduce_dtype_grad_buffer_ctx = cast("YaFSDPBufferContext", reduce_dtype_grad_buffer_ctx)
+            unsharded_param_grad_reduce_dtype = cast(torch.Tensor, unsharded_param_grad_reduce_dtype)
             if (owner := reduce_dtype_grad_buffer_ctx.owner) is not None:
                 raise RuntimeError(f"Reduce dtype gradient buffer already in use by {owner}")
             else:
@@ -117,6 +119,7 @@ def reduce_scatter(
                 padded_sharded_param_grad.copy_(output_tensor)
         post_reduce_event = reduce_scatter_stream.record_event()
         if reduce_dtype is not None:
+            reduce_dtype_grad_buffer_ctx = cast("YaFSDPBufferContext", reduce_dtype_grad_buffer_ctx)
             reduce_dtype_grad_buffer_ctx.release_event = post_reduce_event
             reduce_dtype_grad_buffer_ctx.owner = None
         else:
@@ -146,8 +149,7 @@ def _get_gradient_divide_factors(
     factor: int = 1
     while data_parallel_size % factor == 0 and data_parallel_size / factor > factor:
         factor *= 2
-    factor = float(factor)
-    return (factor, data_parallel_size / factor)
+    return (float(factor), data_parallel_size / factor)
 
 
 def _div_if_needed(tensor: torch.Tensor, div_factor: Optional[float]) -> None:

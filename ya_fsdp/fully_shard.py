@@ -78,7 +78,7 @@ def fully_shard(
         mesh_info = FSDPMeshInfo(
             mesh,
             shard_mesh_dim=0,
-            intra_node_group=intra_node_pg,
+            intra_node_group=intra_node_pg or mesh.get_group(),
         )
     device = _get_device_from_mesh(mesh)
     post_forward_mesh_info = _get_post_forward_mesh_info(reshard_after_forward, mesh_info)
@@ -243,7 +243,7 @@ class YaFSDPModule:
         state_dict_type: StateDictType,
         state_dict_config: Optional[StateDictConfig] = None,
     ) -> StateDictSettings:
-        _state_dict_type_to_config = {
+        _state_dict_type_to_config: Dict[StateDictType, Type[StateDictConfig]] = {
             StateDictType.FULL_STATE_DICT: FullStateDictConfig,
             StateDictType.SHARDED_STATE_DICT: ShardedStateDictConfig,
         }
@@ -258,24 +258,24 @@ class YaFSDPModule:
             )
 
         # Set the state_dict type and configurations.
-        prev_state_dict_type = None
-        prev_state_dict_config = None
-        for state in set(self._get_fsdp_state()._state_ctx.all_states):
-            if (param_group := state._fsdp_param_group) is None:
+        param_groups = [
+            param_group
+            for state in set(self._get_fsdp_state()._state_ctx.all_states)
+            if (param_group := state._fsdp_param_group) is not None
+        ]
+        prev_state_dict_types = {param_group._state_dict_type for param_group in param_groups}
+        if len(prev_state_dict_types) != 1:
+            raise AssertionError(f"YaFSDP expects uniform state_dict_type but got {prev_state_dict_types}")
+        prev_state_dict_type = next(iter(prev_state_dict_types))
+        prev_state_dict_configs = []
+        for param_group in param_groups:
+            if (prev_state_dict_config := param_group._state_dict_config) in prev_state_dict_configs:
                 continue
-            if prev_state_dict_type is None:
-                prev_state_dict_type = param_group._state_dict_type
-            else:
-                assert (
-                    prev_state_dict_type == param_group._state_dict_type
-                ), "All YaFSDP states should have the same state_dict_type."
-            if prev_state_dict_config is None:
-                prev_state_dict_config = param_group._state_dict_config
-            else:
-                assert isinstance(
-                    param_group._state_dict_config, type(prev_state_dict_config)
-                ), "All YaFSDP states must have the same type of state_dict_config."
-
+            prev_state_dict_configs.append(prev_state_dict_config)
+        if len(prev_state_dict_configs) != 1:
+            raise AssertionError(f"YaFSDP expects uniform state_dict_config but got {prev_state_dict_configs}")
+        prev_state_dict_config = next(iter(prev_state_dict_configs))
+        for param_group in param_groups:
             param_group._state_dict_type = state_dict_type
             param_group._state_dict_config = state_dict_config
 

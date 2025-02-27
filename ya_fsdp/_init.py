@@ -41,7 +41,9 @@ def _get_post_forward_mesh_info(
         # For HSDP, we can flatten the two replicate dims into the 0th dim
         post_forward_mesh_tensor = mesh_info.mesh.mesh.view(-1, reshard_after_forward)
         post_forward_mesh = DeviceMesh(mesh_info.mesh.device_type, post_forward_mesh_tensor)
-        post_forward_mesh_info = HSDPMeshInfo(post_forward_mesh, shard_mesh_dim=1, replicate_mesh_dim=0)
+        post_forward_mesh_info = HSDPMeshInfo(
+            post_forward_mesh, mesh_info.intra_node_group, shard_mesh_dim=1, replicate_mesh_dim=0
+        )
     return post_forward_mesh_info
 
 
