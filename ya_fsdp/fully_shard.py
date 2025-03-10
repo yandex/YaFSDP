@@ -179,20 +179,13 @@ class YaFSDPModule:
         """
         self_module = cast(nn.Module, self)
         modules = list(self_module.modules()) if recurse else [self_module]
-        grad_buffer_contexts = set()
-        num_param_groups = 0
         for module in modules:
             if isinstance(module, YaFSDPModule):
                 state = module._get_fsdp_state()
-                if fsdp_param_group := state._fsdp_param_group:
-                    fsdp_param_group.reduce_grads = requires_gradient_sync
-                    grad_buffer_contexts.add(fsdp_param_group._grad_buffer_ctx)
-                    num_param_groups += 1
-        if not requires_gradient_sync and (num_grad_buffers := len(grad_buffer_contexts)) < num_param_groups:
-            raise ValueError(
-                "YaFSDP with no reduce_grads requires number of grad buffers to be no less than number of"
-                f" parameter groups, but got {num_grad_buffers=} {num_param_groups=}"
-            )
+
+                if (param_group := state._fsdp_param_group) is not None:
+                    param_group.reduce_grads = requires_gradient_sync
+                    state._validate_shared_state()
 
     def set_reshard_after_backward(self, reshard_after_backward: bool, *, recurse: bool = True) -> None:
         """
@@ -213,6 +206,7 @@ class YaFSDPModule:
                 state = module._get_fsdp_state()
                 if fsdp_param_group := state._fsdp_param_group:
                     fsdp_param_group.reshard_after_backward = reshard_after_backward
+                    state._validate_shared_state()
 
     def set_modules_to_forward_prefetch(self, modules: List["YaFSDPModule"]) -> None:
         """

@@ -248,6 +248,9 @@ class YaFSDPParam:
         ):
             unsafe_setattr_param(shared_module, shared_param_name, param)
 
+    def __repr__(self):
+        return f"YaFSDPParam(fqn={self._param_fqn}, orig_size={self._orig_size})"
+
 
 # NOTE: These bypass `nn.Module.__setattr__` checks, which incur non-trivial
 # CPU overhead, if the module did not override it. For FSDP, we know we do not

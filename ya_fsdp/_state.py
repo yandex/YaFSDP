@@ -155,6 +155,7 @@ class YaFSDPState(_State):
                 f" {[fsdp_param._param_fqn for fsdp_param in self._fsdp_param_group.fsdp_params]}"
             )
         self._init_shared_state(num_data_buffers, num_grad_buffers, yccl_handle)
+        self._validate_shared_state()
         # Run parameter group lazy inits after initializing FQNs for improved
         # error messages
         for state in self._state_ctx.all_states:
@@ -177,17 +178,6 @@ class YaFSDPState(_State):
         param_groups = [
             state._fsdp_param_group for state in self._state_ctx.all_states if state._fsdp_param_group is not None
         ]
-
-        if num_data_buffers < (
-            num_param_groups_with_no_reshard_after_forward := sum(
-                not param_group._reshard_after_forward for param_group in param_groups
-            )
-        ):
-            raise ValueError(
-                "YaFSDP with no reshard_after_forward requires number of data buffers to be no less than number of"
-                " parameter groups with no reshard_after_forward, but got"
-                f" {num_data_buffers=} {num_param_groups_with_no_reshard_after_forward=}"
-            )
 
         if num_data_buffers < min(2, num_param_groups := len(param_groups)):
             raise ValueError(
@@ -250,6 +240,58 @@ class YaFSDPState(_State):
             )
             for param_group in ctx_using_param_groups:
                 param_group._reduce_dtype_grad_buffer_ctx = reduce_dtype_grad_buffer_ctx
+
+    def _validate_shared_state(self) -> None:
+        data_buffer_ctx2ctx_using_param_groups = {}
+        grad_buffer_ctx2ctx_using_param_groups = {}
+        for state in self._state_ctx.all_states:
+            if (param_group := state._fsdp_param_group) is None:
+                continue
+            data_buffer_ctx2ctx_using_param_groups.setdefault(param_group._data_buffer_ctx, []).append(param_group)
+            if param_group._grad_buffer_ctx is None:
+                continue
+            grad_buffer_ctx2ctx_using_param_groups.setdefault(param_group._grad_buffer_ctx, []).append(param_group)
+        for ctx_using_param_groups in data_buffer_ctx2ctx_using_param_groups.values():
+            if (
+                len(
+                    param_groups_with_no_reshard_after_forward := [
+                        param_group for param_group in ctx_using_param_groups if not param_group._reshard_after_forward
+                    ]
+                )
+                > 1
+            ):
+                raise ValueError(
+                    "Only one parameter group across groups which share a data buffer"
+                    "is allowed to have no reshard after forward"
+                    f", but got {param_groups_with_no_reshard_after_forward=}"
+                )
+            if (
+                len(
+                    param_groups_with_no_reshard_after_backward := [
+                        param_group for param_group in ctx_using_param_groups if not param_group.reshard_after_backward
+                    ]
+                )
+                > 1
+            ):
+                raise ValueError(
+                    "Only one parameter group across groups which share a data buffer"
+                    "is allowed to have no reshard_after_backward"
+                    f", but got {param_groups_with_no_reshard_after_backward=}"
+                )
+        for ctx_using_param_groups in grad_buffer_ctx2ctx_using_param_groups.values():
+            if (
+                len(
+                    param_groups_with_no_reduce_grads := [
+                        param_group for param_group in ctx_using_param_groups if not param_group.reduce_grads
+                    ]
+                )
+                > 1
+            ):
+                raise ValueError(
+                    "Only one parameter group across groups which share a grad buffer"
+                    "is allowed to have no grads reduce"
+                    f", but got {param_groups_with_no_reduce_grads=}"
+                )
 
     def _init_fqns(self) -> None:
         """Sets module and parameter FQN attributes for debugging."""
