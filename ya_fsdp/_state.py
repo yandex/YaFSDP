@@ -55,6 +55,8 @@ class YaFSDPState(_State):
         self._state_ctx = YaFSDPStateContext()
         self._comm_ctx = YaFSDPCommContext()
         self._training_state: TrainingState = TrainingState.IDLE
+        self._states_to_forward_prefetch: List[YaFSDPState] = []
+        self._states_to_backward_prefetch: List[YaFSDPState] = []
         self._modules_to_run_forward: Set[nn.Module] = set()
 
     # Define a separate init since `__init__` is called in the contract
@@ -289,6 +291,9 @@ class YaFSDPState(_State):
                 args, kwargs = tree_map(cast_fn, args), tree_map(cast_fn, kwargs)
         if self._fsdp_param_group:
             args, kwargs = self._fsdp_param_group.pre_forward(module, args, kwargs)
+        for fsdp_state in self._states_to_forward_prefetch:
+            if (target_param_group := fsdp_state._fsdp_param_group) is not None:
+                YaFSDPParamGroup._prefetch_unshard(target_param_group, "forward")
         return args, kwargs
 
     def _post_forward(self, module: nn.Module, input: Any, output: Any) -> Any:
@@ -314,7 +319,11 @@ class YaFSDPState(_State):
         self._training_state = TrainingState.PRE_BACKWARD
         self._register_root_post_backward_final_callback()
         if self._fsdp_param_group:
-            self._fsdp_param_group.pre_backward()
+            default_prefetch = len(self._states_to_backward_prefetch) == 0
+            self._fsdp_param_group.pre_backward(default_prefetch)
+        for fsdp_state in self._states_to_backward_prefetch:
+            if (target_param_group := fsdp_state._fsdp_param_group) is not None:
+                YaFSDPParamGroup._prefetch_unshard(target_param_group, "backward")
         return grad
 
     def _root_post_backward_final_callback(self) -> None:
@@ -328,7 +337,7 @@ class YaFSDPState(_State):
                     fsdp_param_group.post_backward()
                 state._training_state = TrainingState.IDLE
                 if fsdp_param_group:
-                    fsdp_param_group.training_state = TrainingState.IDLE
+                    fsdp_param_group._training_state = TrainingState.IDLE
                 if self._state_ctx.is_last_backward:
                     state._finalize_backward()
             self._comm_ctx.post_forward_order.clear()

@@ -1,5 +1,5 @@
 import contextlib
-from typing import Any, Dict, Generator, List, NoReturn, Optional, Type, Union, cast
+from typing import Any, Dict, Generator, Iterable, List, NoReturn, Optional, Type, Union, cast
 
 import torch
 import torch.distributed as dist
@@ -214,6 +214,42 @@ class YaFSDPModule:
                 if fsdp_param_group := state._fsdp_param_group:
                     fsdp_param_group.reshard_after_backward = reshard_after_backward
 
+    def set_modules_to_forward_prefetch(self, modules: List["YaFSDPModule"]) -> None:
+        """
+        Sets the FSDP modules for which this FSDP module should explicitly
+        prefetch all-gathers in forward. The prefetching runs after this
+        module's all-gather copy-out.
+
+        Passing a singleton list containing the next FSDP module gives the same
+        all-gather overlap behavior as the default overlap behavior, except the
+        prefetched all-gather is issued earlier from the CPU. Passing a list
+        with at least length two is required for more aggressive overlap and
+        will use more reserved memory.
+
+        Args:
+            modules (List[FSDPModule]): FSDP modules to prefetch.
+        """
+        _assert_all_fsdp_modules(modules)
+        self._get_fsdp_state()._states_to_forward_prefetch = [module._get_fsdp_state() for module in modules]
+
+    def set_modules_to_backward_prefetch(self, modules: List["YaFSDPModule"]) -> None:
+        """
+        Sets the FSDP modules for which this FSDP module should explicitly
+        prefetch all-gathers in backward. This overrides the default backward
+        pretching implementation that prefetches the next FSDP module based on
+        the reverse post-forward order.
+
+        Passing a singleton list containing the previous FSDP module gives the
+        same all-gather overlap behavior as the default overlap behavior.
+        Passing a list with at least length two is required for more aggressive
+        overlap and will use more reserved memory.
+
+        Args:
+            modules (List[YaFSDPModule]): FSDP modules to prefetch.
+        """
+        _assert_all_fsdp_modules(modules)
+        self._get_fsdp_state()._states_to_backward_prefetch = [module._get_fsdp_state() for module in modules]
+
     def set_post_optim_event(self, event: torch.Event) -> None:
         """
         Sets a post-optimizer-step event for the root FSDP module to wait the
@@ -296,3 +332,9 @@ class YaFSDPModule:
             prev_state_dict_settings.state_dict_type,
             prev_state_dict_settings.state_dict_config,
         )
+
+
+def _assert_all_fsdp_modules(modules: Iterable[Any]) -> None:
+    for module in modules:
+        if not isinstance(module, YaFSDPModule):
+            raise ValueError(f"Expects YaFSDPModule but got {type(module)}: {module}")

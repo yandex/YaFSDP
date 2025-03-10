@@ -226,11 +226,12 @@ class YaFSDPParam:
     def to_unsharded(self, training_state: Optional[TrainingState] = None) -> None:
         # Assume that the data has been allocated and all-gathered
         if training_state == TrainingState.FORWARD and torch.is_grad_enabled() and self.sharded_param.requires_grad:
-            self._setattr_on_modules(self._unsharded_params_for_backward[-1])
+            unsharded_param = self._unsharded_params_for_backward[-1]
         elif training_state == TrainingState.PRE_BACKWARD and self.sharded_param.requires_grad:
-            self._setattr_on_modules(self._unsharded_params_for_backward.pop())
+            unsharded_param = self._unsharded_params_for_backward.pop()
         else:
-            self._setattr_on_modules(self._unsharded_param)
+            unsharded_param = self._unsharded_param
+        self._setattr_on_modules(unsharded_param)
         # if self.sharded_state == ShardedState.SHARDED_POST_FORWARD:
         #     # The data is allocated in the default stream via the post-forward
         #     # reshard and must be kept alive for the next all-gather copy-in.

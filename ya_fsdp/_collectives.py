@@ -37,7 +37,7 @@ def all_gather(
     with device_handle.stream(all_gather_stream):
         if param_dtype is not None:
             input_tensor = padded_sharded_param_data_param_dtype
-            if param_group.training_state == TrainingState.FORWARD and not param_group.is_sharded_param_grad_set():
+            if param_group._training_state == TrainingState.FORWARD and not param_group.is_sharded_param_grad_set():
                 input_tensor.copy_(padded_sharded_param_data)
         else:
             input_tensor = padded_sharded_param_data

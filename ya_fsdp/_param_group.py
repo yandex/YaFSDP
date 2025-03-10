@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     try:
         import yccl
     except ImportError:
-        yccl = None
+        pass
 
 logger = logging.getLogger("ya_fsdp")
 
@@ -103,7 +103,7 @@ class YaFSDPParamGroup:
         self.device = device
         self.device_handle = _get_device_handle(device.type)
         self.mp_policy = mp_policy
-        self.training_state = TrainingState.IDLE
+        self._training_state = TrainingState.IDLE
         # Group's sharded state always matches its parameters' sharded states
         self._sharded_state = ShardedState.SHARDED
         self._module_fqn: Optional[str] = None  # prefixed from root module
@@ -251,13 +251,17 @@ class YaFSDPParamGroup:
             return
         if self.is_unsharded:
             return  # no-op
-        if not self.unshard_in_backward and self.training_state == TrainingState.PRE_BACKWARD:
+        if not self.unshard_in_backward and self._training_state == TrainingState.PRE_BACKWARD:
             return
         # if self._reshard_after_forward_event is not None:
         #     # Resharded parameter data is allocated in the default stream and
         #     # used in the all-gather streams
         #     self._wait_all_gather_stream_on_event(self._reshard_after_forward_event)
         #     self._reshard_after_forward_event = None
+        if self._training_state == TrainingState.FORWARD:
+            logger.debug("%s", self._with_fqn("YaFSDP::pre_forward_unshard"))
+        elif self._training_state == TrainingState.PRE_BACKWARD:
+            logger.debug("%s", self._with_fqn("YaFSDP::pre_backward_unshard"))
         with record_function(self._with_fqn("YaFSDP::all_gather")):
             self._all_gather_event = all_gather(
                 self,
@@ -266,7 +270,7 @@ class YaFSDPParamGroup:
                 self._unsharded_param_data,
                 self._data_buffer_ctx,
                 self._all_gather_process_group,
-                self.comm_ctx.get_all_gather_stream(self.training_state),
+                self.comm_ctx.get_all_gather_stream(self._training_state),
                 self._param_dtype,
                 self.device_handle,
                 self.comm_ctx.yccl_handle,
@@ -279,7 +283,7 @@ class YaFSDPParamGroup:
         self._to_unsharded()
 
     def reshard(self):
-        if self.training_state == TrainingState.FORWARD:
+        if self._training_state == TrainingState.FORWARD:
             if not self._reshard_after_forward:
                 return
             if self._use_post_forward_mesh:
@@ -288,6 +292,9 @@ class YaFSDPParamGroup:
                 # self._reshard_after_forward_event = torch.Event()
                 # self._reshard_after_forward_event.record()
                 # return
+            logger.debug("%s", self._with_fqn("YaFSDP::post_forward_reshard"))
+        elif self._training_state == TrainingState.POST_BACKWARD:
+            logger.debug("%s", self._with_fqn("YaFSDP::post_backward_reshard"))
         self._to_sharded()
         self._data_buffer_ctx.release_event = self.device_handle.current_stream().record_event()
         self._data_buffer_ctx.owner = None
@@ -297,7 +304,7 @@ class YaFSDPParamGroup:
     ) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
         logger.debug("%s", self._with_fqn("YaFSDP::pre_forward"))
         with record_function(self._with_fqn("YaFSDP::pre_forward")):
-            self.training_state = TrainingState.FORWARD
+            self._training_state = TrainingState.FORWARD
             self.unshard()
             args, kwargs, unsharded_params = self._register_post_backward_hook(args, kwargs)
             for fsdp_param, unsharded_param in unsharded_params.items():
@@ -311,7 +318,7 @@ class YaFSDPParamGroup:
             self.reshard()
             if torch.is_grad_enabled():
                 self._record_post_forward()
-            self.training_state = TrainingState.IDLE
+            self._training_state = TrainingState.IDLE
             return output
 
     def _record_post_forward(self) -> None:
@@ -321,14 +328,16 @@ class YaFSDPParamGroup:
         self.comm_ctx.post_forward_order.append(self)
         self._post_forward_indices.append(post_forward_index)
 
-    def pre_backward(self):
-        if self.training_state == TrainingState.PRE_BACKWARD:
+    def pre_backward(self, default_prefetch: bool, *unused: Any):
+        if self._training_state == TrainingState.PRE_BACKWARD:
             return
         logger.debug("%s", self._with_fqn("YaFSDP::pre_backward"))
         with record_function(self._with_fqn("YaFSDP::pre_backward")):
-            self.training_state = TrainingState.PRE_BACKWARD
+            self._training_state = TrainingState.PRE_BACKWARD
             self.unshard()
             self.wait_for_unshard()
+            if default_prefetch:
+                self._backward_prefetch()
         if self._grad_buffer_ctx is None:
             return
         if (owner := self._grad_buffer_ctx.owner) is not None and owner != self:
@@ -342,12 +351,11 @@ class YaFSDPParamGroup:
         # This method should be idempotent and safe to call even when this
         # FSDP parameter group was not used in backward (should be a no-op)
         logger.debug("%s", self._with_fqn("YaFSDP::post_backward"))
-        self.training_state = TrainingState.POST_BACKWARD
+        self._training_state = TrainingState.POST_BACKWARD
         with record_function(self._with_fqn("YaFSDP::post_backward_reshard")):
             if not self.reduce_grads:
                 if self.reshard_after_backward:
                     self.reshard()
-                self._backward_prefetch()
                 return
             fsdp_params_with_grad: List[YaFSDPParam] = []
             for fsdp_param in self.fsdp_params:
@@ -358,11 +366,11 @@ class YaFSDPParamGroup:
                 self.reshard()
             # we prefetch here and not in pre_backward to avoid prefetching a layer into
             # the same buffer the layer we're performing backward on is using
-            self._backward_prefetch()
         if self._grad_buffer_ctx is None:
             assert len(fsdp_params_with_grad) == 0
             return
         if len(fsdp_params_with_grad) != 0:
+            logger.debug("%s", self._with_fqn("YaFSDP::post_backward_reduce"))
             with record_function(self._with_fqn("YaFSDP::post_backward_reduce")):
                 self._post_reduce_event, grad_buffer_release_event = reduce_scatter(
                     self,
@@ -421,7 +429,8 @@ class YaFSDPParamGroup:
         # have mistargeted prefetches if not all modules used in forward
         # are used in this backward
         target_fsdp_param_group = self.comm_ctx.post_forward_order[target_index]
-        self._prefetch_unshard(target_fsdp_param_group, "backward")
+        if target_fsdp_param_group._data_buffer_ctx is not self._data_buffer_ctx:
+            self._prefetch_unshard(target_fsdp_param_group, "backward")
 
     @staticmethod
     def _prefetch_unshard(target_fsdp_param_group: "YaFSDPParamGroup", pass_type: str) -> None:
@@ -432,6 +441,7 @@ class YaFSDPParamGroup:
         else:
             raise ValueError(f"Unknown pass type: {pass_type}")
         target_fqn = target_fsdp_param_group._module_fqn
+        logger.debug("%s", f"YaFSDP::{pass_type}_prefetch for {target_fqn}")
         with record_function(
             f"YaFSDP::{pass_type}_prefetch for {target_fqn}"
         ), target_fsdp_param_group.use_training_state(training_state):
@@ -452,7 +462,7 @@ class YaFSDPParamGroup:
 
     def _to_unsharded(self):
         for fsdp_param in self.fsdp_params:
-            fsdp_param.to_unsharded(self.training_state)
+            fsdp_param.to_unsharded(self._training_state)
         if not self.is_unsharded:
             self._sharded_state = ShardedState.UNSHARDED
 
@@ -470,12 +480,12 @@ class YaFSDPParamGroup:
 
     @contextlib.contextmanager
     def use_training_state(self, training_state: TrainingState):
-        old_training_state = self.training_state
-        self.training_state = training_state
+        old_training_state = self._training_state
+        self._training_state = training_state
         try:
             yield
         finally:
-            self.training_state = old_training_state
+            self._training_state = old_training_state
 
     # Hook Registration #
     def _register_post_backward_hook(
