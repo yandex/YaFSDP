@@ -125,11 +125,17 @@ def _get_managed_states(
 def _move_modules_to_device(
     modules: List[nn.Module],
     device: torch.device,
+    param_dtype: Optional[torch.dtype] = None,
 ) -> None:
     prev_overwrite_module_params_on_conversion = torch.__future__.get_overwrite_module_params_on_conversion()
     torch.__future__.set_overwrite_module_params_on_conversion(True)
     for module in modules:
-        module._apply(lambda t: torch.empty_like(t, device=device) if t.is_meta else t.to(device), recurse=False)
+        module._apply(
+            lambda t: torch.empty_like(t, dtype=param_dtype if isinstance(t, nn.Parameter) else None, device=device)
+            if t.is_meta
+            else t.to(dtype=param_dtype if isinstance(t, nn.Parameter) else None, device=device),
+            recurse=False,
+        )
     torch.__future__.set_overwrite_module_params_on_conversion(prev_overwrite_module_params_on_conversion)
 
 

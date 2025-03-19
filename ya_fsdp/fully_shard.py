@@ -39,6 +39,7 @@ def fully_shard(
     mesh: DeviceMesh,
     *,
     intra_node_pg: Optional[dist.ProcessGroup] = None,
+    orig_dtype: Optional[torch.dtype] = None,
     reshard_after_forward: bool = True,
     mp_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
 ):
@@ -89,7 +90,7 @@ def fully_shard(
     state.init(modules, device, mp_policy)
 
     managed_modules = _get_managed_modules(modules)
-    _move_modules_to_device(managed_modules, device)
+    _move_modules_to_device(managed_modules, device, param_dtype=orig_dtype)
     params, buffers = _get_managed_states(managed_modules)
     _sync_states(params, buffers, process_group=mesh_info.intra_node_group)
     if params:
