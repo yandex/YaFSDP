@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     try:
         import yccl
     except ImportError:
-        yccl = None
+        pass
 
 
 def all_gather(

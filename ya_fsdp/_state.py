@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     try:
         import yccl
     except ImportError:
-        yccl = None
+        pass
 
 logger = logging.getLogger("ya_fsdp")
 
@@ -218,6 +218,10 @@ class YaFSDPState(_State):
             )
             for param_group in ctx_using_param_groups:
                 param_group._data_buffer_ctx = data_buffer_ctx
+            # Do not reshard the last module across modules using the same data buffer
+            # after forward since for training the parameters would be
+            # freed and all-gathered immediately
+            ctx_using_param_groups[-1].post_forward_mesh_info = None
         for grad_buffer_ctx, ctx_using_param_groups in grad_buffer_ctx2ctx_using_param_groups.items():
             buffer_size = max(param_group._padded_unsharded_data_size for param_group in ctx_using_param_groups)
             grad_buffer_ctx.lazy_init(
@@ -373,7 +377,7 @@ class YaFSDPState(_State):
         with torch.profiler.record_function("YaFSDP::root_post_backward_callback"):
             for state in self._state_ctx.all_states:
                 fsdp_param_group = state._fsdp_param_group
-                if fsdp_param_group and fsdp_param_group.is_unsharded and fsdp_param_group.reshard_after_backward:
+                if fsdp_param_group and (fsdp_param_group.is_unsharded or not fsdp_param_group.unshard_in_backward):
                     # Run post-backward in case forward inputs did not require
                     # gradient so the autograd backward did not run
                     fsdp_param_group.post_backward()

@@ -258,10 +258,7 @@ class YaFSDPParamGroup:
         #     # used in the all-gather streams
         #     self._wait_all_gather_stream_on_event(self._reshard_after_forward_event)
         #     self._reshard_after_forward_event = None
-        if self._training_state == TrainingState.FORWARD:
-            logger.debug("%s", self._with_fqn("YaFSDP::pre_forward_unshard"))
-        elif self._training_state == TrainingState.PRE_BACKWARD:
-            logger.debug("%s", self._with_fqn("YaFSDP::pre_backward_unshard"))
+        logger.debug("%s", self._with_fqn(f"YaFSDP::{self._training_state.name.lower()}_unshard"))
         with record_function(self._with_fqn("YaFSDP::all_gather")):
             self._all_gather_event = all_gather(
                 self,
@@ -292,9 +289,7 @@ class YaFSDPParamGroup:
                 # self._reshard_after_forward_event = torch.Event()
                 # self._reshard_after_forward_event.record()
                 # return
-            logger.debug("%s", self._with_fqn("YaFSDP::post_forward_reshard"))
-        elif self._training_state == TrainingState.POST_BACKWARD:
-            logger.debug("%s", self._with_fqn("YaFSDP::post_backward_reshard"))
+        logger.debug("%s", self._with_fqn(f"YaFSDP::{self._training_state.name.lower()}_reshard"))
         self._to_sharded()
         self._data_buffer_ctx.release_event = self.device_handle.current_stream().record_event()
         self._data_buffer_ctx.owner = None
@@ -403,6 +398,13 @@ class YaFSDPParamGroup:
 
     def finalize_backward(self):
         self._wait_for_post_backward()
+        if self._all_gather_event is not None:
+            # If there was a mistargeted unshard without a corresponding wait,
+            # then we wait here and clear the unshard
+            logger.debug("%s", self._with_fqn("YaFSDP::wait_for_mistargeted_unshard"))
+            self.device_handle.current_stream().wait_event(self._all_gather_event)
+            self._all_gather_event = None
+            self._data_buffer_ctx.owner = None
         self._post_forward_indices.clear()
         for fsdp_param in self.fsdp_params:
             if fsdp_param.sharded_param.requires_grad:
