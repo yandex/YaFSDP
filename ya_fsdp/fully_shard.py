@@ -42,6 +42,7 @@ def fully_shard(
     orig_dtype: Optional[torch.dtype] = None,
     reshard_after_forward: bool = True,
     mp_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
+    shard_alignment: int = 8,
 ):
     """
     Apply YaFSDP to ``module``, where YaFSDP shards module parameters,
@@ -69,6 +70,8 @@ def fully_shard(
         mp_policy (MixedPrecisionPolicy): This controls the mixed precision
             policy, which offers parameter/reduction mixed precision for this
             module. See :class:`MixedPrecisionPolicy` for details.
+        shard_alignment (int): This controls alignment (in elements) of each
+            shard tensor (which is padded to specified alignment)
     """
     if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
         raise ValueError(f"fully_shard does not support containers that do not implement forward: {module}")
@@ -101,6 +104,7 @@ def fully_shard(
             post_forward_mesh_info,
             device,
             mp_policy,
+            shard_alignment
         )
         del params
         torch.cuda.empty_cache()

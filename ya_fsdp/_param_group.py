@@ -85,6 +85,7 @@ class YaFSDPParamGroup:
         post_forward_mesh_info: Optional[FSDPMeshInfo],
         device: torch.device,
         mp_policy: MixedPrecisionPolicy,
+        shard_alignment: int,
     ):
         self.modules = modules  # permit ref cycle because 1:1 lifetime
         param_module_infos = _get_param_module_infos(params, modules)
@@ -150,7 +151,7 @@ class YaFSDPParamGroup:
         self._unsharded_data_offsets = [0, *torch.cumsum(torch.tensor(unsharded_data_numels[:-1]), 0).tolist()]
 
         padded_unsharded_data_size = sum(unsharded_data_numels)
-        divider = shard_world_size * 8
+        divider = shard_world_size * shard_alignment
         if padded_unsharded_data_size % divider != 0:
             padded_unsharded_data_size += divider - padded_unsharded_data_size % divider
         self._padded_unsharded_data_size = padded_unsharded_data_size
