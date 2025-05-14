@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional
 
+import torch
 import torch.distributed as dist
 from torch.distributed._tensor import DeviceMesh
 
@@ -58,3 +59,9 @@ class TrainingState(Enum):
     POST_BACKWARD = auto()
     # Idle before/after forward or before pre-backward/after post-backward
     IDLE = auto()
+
+
+def _cast_fp_tensor(dtype: torch.dtype, x: torch.Tensor) -> torch.Tensor:
+    if not isinstance(x, torch.Tensor) or not torch.is_floating_point(x) or x.dtype == dtype:
+        return x
+    return x.to(dtype)

@@ -7,14 +7,13 @@ import torch.nn as nn
 from torch._logging import warning_once
 from torch.autograd import Variable
 from torch.autograd.graph import _MultiHandle
-from torch.distributed._composable.fsdp._fsdp_common import _cast_fp_tensor
 from torch.distributed._composable_state import _get_module_state, _insert_module_state, _State
 from torch.distributed.device_mesh import _get_device_handle
 from torch.distributed.utils import _to_kwargs
 from torch.utils._pytree import tree_flatten, tree_map
 
 from ._api import MixedPrecisionPolicy
-from ._common import TrainingState
+from ._common import TrainingState, _cast_fp_tensor
 from ._param_group import YaFSDPCommContext, YaFSDPParamGroup
 
 if TYPE_CHECKING:
