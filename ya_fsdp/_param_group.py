@@ -1,6 +1,7 @@
 import contextlib
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, cast
+from enum import Enum, auto
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
 
 import torch
 import torch.distributed as dist
@@ -30,22 +31,40 @@ _ModuleToHandleDict = Dict[nn.Module, RemovableHandle]  # for state dict
 class YaFSDPBufferContext:
     """This has the buffer state for all-gather / reduce-scatter ops shared across YaFSDP parameter groups."""
 
+    class BufferType(Enum):
+        ALL_GATHER = auto()
+        REDUCE_SCATTER = auto()
+
     def lazy_init(
-        self, buffer_size: int, dtype: torch.dtype, device: torch.device, yccl_handle: Optional[Callable] = None
+        self,
+        buffer_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        buffer_type: Optional[BufferType] = None,
+        yccl_handle: Optional["yccl.Handle"] = None,
     ):
         if yccl_handle is not None and dtype != torch.bfloat16:
             raise RuntimeError("YCCL requires param_dtype and reduce_dtype to be bfloat16")
         self.buffer = (
-            torch.empty(buffer_size, dtype=dtype, device=device) if yccl_handle is None else yccl_handle(buffer_size)
+            torch.empty(buffer_size, dtype=dtype, device=device)
+            if yccl_handle is None
+            else getattr(
+                yccl_handle,
+                {
+                    self.BufferType.ALL_GATHER: "add_all_gather_output_buffer",
+                    self.BufferType.REDUCE_SCATTER: "add_reduce_scatter_buffer",
+                }[buffer_type],
+            )(buffer_size)
         )
         self.owner: Optional[YaFSDPParamGroup] = None
         self.release_event: Optional[torch.Event] = None
+        self.yccl_handle: Optional["yccl.Handle"] = yccl_handle
 
 
 class YaFSDPCommContext:
     """This has the communication state shared across YaFSDP states/parameter groups."""
 
-    def lazy_init(self, device: torch.device, yccl_handle: Optional["yccl.Handle"]):
+    def lazy_init(self, device: torch.device):
         self.device_handle = _get_device_handle(device.type)
         high_priority = -1
         # All-gather stream allows overlapping next all-gather with current
@@ -55,7 +74,6 @@ class YaFSDPCommContext:
         # backward logic like pre/post-gradient division and reduce-scatter
         self.reduce_scatter_stream = self.all_gather_stream
         self.post_forward_order: List[YaFSDPParamGroup] = []  # will cause ref cycles
-        self.yccl_handle: Optional["yccl.Handle"] = yccl_handle
 
     def get_all_gather_stream(self, training_state: TrainingState) -> torch.Stream:
         if training_state in (TrainingState.FORWARD, TrainingState.PRE_BACKWARD):
@@ -239,12 +257,15 @@ class YaFSDPParamGroup:
         self._validate_no_meta_params()
         self._register_state_dict_hooks()
         self._init_unsharded_params()
-        if (yccl_handle := self.comm_ctx.yccl_handle) is not None:
-            if self._reduce_dtype is not None:
-                raise NotImplementedError("YCCL requires param_dtype and reduce_dtype to be the same.")
+        if (yccl_handle := self._data_buffer_ctx.yccl_handle) is not None:
             self._padded_sharded_param_data_param_dtype = yccl_handle.add_all_gather_input_buffer(
                 self._padded_sharded_param_data_param_dtype.numel()
             ).copy_(self._padded_sharded_param_data_param_dtype)
+        if (grad_buffer_ctx := self._grad_buffer_ctx) is not None and (
+            yccl_handle := grad_buffer_ctx.yccl_handle
+        ) is not None:
+            if self._reduce_dtype is not None:
+                raise NotImplementedError("YCCL requires param_dtype and reduce_dtype to be the same.")
 
     # Runtime #
     def unshard(self):
@@ -271,7 +292,7 @@ class YaFSDPParamGroup:
                 self.comm_ctx.get_all_gather_stream(self._training_state),
                 self._param_dtype,
                 self.device_handle,
-                self.comm_ctx.yccl_handle,
+                self._data_buffer_ctx.yccl_handle,
             )
 
     def wait_for_unshard(self):
@@ -382,7 +403,7 @@ class YaFSDPParamGroup:
                     self._reduce_dtype,
                     self.device_handle,
                     self.mp_policy.bit32_acc_for_bit16_reduce_scatter,
-                    self.comm_ctx.yccl_handle,
+                    self._grad_buffer_ctx.yccl_handle,
                 )
         else:
             grad_buffer_release_event = self.device_handle.current_stream().record_event()

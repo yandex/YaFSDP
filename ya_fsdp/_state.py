@@ -14,7 +14,7 @@ from torch.utils._pytree import tree_flatten, tree_map
 
 from ._api import MixedPrecisionPolicy
 from ._common import TrainingState, _cast_fp_tensor
-from ._param_group import YaFSDPCommContext, YaFSDPParamGroup
+from ._param_group import YaFSDPBufferContext, YaFSDPCommContext, YaFSDPParamGroup
 
 if TYPE_CHECKING:
     from ._param import YaFSDPParam
@@ -110,9 +110,12 @@ class YaFSDPState(_State):
 
     def _lazy_init(
         self,
-        num_data_buffers: int = 2,
-        num_grad_buffers: int = 2,
+        allow_no_grad_reduce: bool = False,
         yccl_handle: Optional["yccl.Handle"] = None,
+        param_group_to_data_buffer_ctx_idx: Optional[dict[YaFSDPParamGroup, int]] = None,
+        param_group_to_grad_buffer_ctx_idx: Optional[dict[YaFSDPParamGroup, int]] = None,
+        data_buffer_ctx_idx_to_yccl_handle: Optional[dict[int, "yccl.Handle"]] = None,
+        grad_buffer_ctx_idx_to_yccl_handle: Optional[dict[int, "yccl.Handle"]] = None,
     ) -> None:
         """
         Lazy initialization represents when all modules' parallelisms have
@@ -153,7 +156,14 @@ class YaFSDPState(_State):
                 ", but root module got parameters"
                 f" {[fsdp_param._param_fqn for fsdp_param in self._fsdp_param_group.fsdp_params]}"
             )
-        self._init_shared_state(num_data_buffers, num_grad_buffers, yccl_handle)
+        self._init_shared_state(
+            allow_no_grad_reduce,
+            yccl_handle,
+            param_group_to_data_buffer_ctx_idx,
+            param_group_to_grad_buffer_ctx_idx,
+            data_buffer_ctx_idx_to_yccl_handle,
+            grad_buffer_ctx_idx_to_yccl_handle,
+        )
         self._validate_shared_state()
         # Run parameter group lazy inits after initializing FQNs for improved
         # error messages
@@ -163,11 +173,14 @@ class YaFSDPState(_State):
 
     def _init_shared_state(
         self,
-        num_data_buffers: int,
-        num_grad_buffers: int,
+        allow_no_grad_reduce: bool,
         yccl_handle: Optional["yccl.Handle"],
+        param_group_to_data_buffer_ctx_idx: Optional[dict[YaFSDPParamGroup, int]],
+        param_group_to_grad_buffer_ctx_idx: Optional[dict[YaFSDPParamGroup, int]],
+        data_buffer_ctx_idx_to_yccl_handle: Optional[dict[int, "yccl.Handle"]],
+        grad_buffer_ctx_idx_to_yccl_handle: Optional[dict[int, "yccl.Handle"]],
     ) -> None:
-        self._comm_ctx.lazy_init(self._device, yccl_handle)
+        self._comm_ctx.lazy_init(self._device)
         for state in self._state_ctx.all_states:
             state._state_ctx = self._state_ctx
             state._comm_ctx = self._comm_ctx
@@ -178,42 +191,41 @@ class YaFSDPState(_State):
             state._fsdp_param_group for state in self._state_ctx.all_states if state._fsdp_param_group is not None
         ]
 
-        if num_data_buffers < min(2, num_param_groups := len(param_groups)):
-            raise ValueError(
-                "num_data_buffers must be no less than min(2, num_param_groups)"
-                f" for correct overlap, but got {num_data_buffers=} {num_param_groups=}."
-            )
+        no_reshard_after_forward = all(not param_group._reshard_after_forward for param_group in param_groups)
+        data_buffer_ctx2ctx_using_param_groups, data_buffer_ctx2yccl_handle = get_buffer_ctx2ctx_using_param_groups_map(
+            param_groups,
+            "_data_buffer_ctx",
+            len(param_groups) if no_reshard_after_forward else 2,
+            param_group_to_data_buffer_ctx_idx,
+            data_buffer_ctx_idx_to_yccl_handle,
+        )
+        grad_buffer_ctx2ctx_using_param_groups, grad_buffer_ctx2yccl_handle = get_buffer_ctx2ctx_using_param_groups_map(
+            (
+                param_groups_with_grads := [
+                    param_group for param_group in param_groups if param_group._grad_buffer_ctx is not None
+                ]
+            ),
+            "_grad_buffer_ctx",
+            len(param_groups_with_grads) if allow_no_grad_reduce else 2,
+            param_group_to_grad_buffer_ctx_idx,
+            grad_buffer_ctx_idx_to_yccl_handle,
+        )
+        reduce_dtype_grad_buffer_ctx2ctx_using_param_groups, _ = get_buffer_ctx2ctx_using_param_groups_map(
+            [param_group for param_group in param_groups if param_group._reduce_dtype_grad_buffer_ctx is not None],
+            "_reduce_dtype_grad_buffer_ctx",
+            1,
+        )
 
-        data_buffer_ctx2ctx_using_param_groups = {}
-        for index, param_group in enumerate(param_groups):
-            data_buffer_ctx2ctx_using_param_groups.setdefault(
-                param_groups[index % num_data_buffers]._data_buffer_ctx, []
-            ).append(param_group)
-        grad_buffer_ctx2ctx_using_param_groups = {}
-        for index, param_group in enumerate(
-            param_groups_with_ctx := [
-                param_group for param_group in param_groups if param_group._grad_buffer_ctx is not None
-            ]
-        ):
-            grad_buffer_ctx2ctx_using_param_groups.setdefault(
-                param_groups_with_ctx[index % num_grad_buffers]._grad_buffer_ctx, []
-            ).append(param_group)
-        reduce_dtype_grad_buffer_ctx2ctx_using_param_groups = {}
-        for index, param_group in enumerate(
-            param_groups_with_ctx := [
-                param_group for param_group in param_groups if param_group._reduce_dtype_grad_buffer_ctx is not None
-            ]
-        ):
-            reduce_dtype_grad_buffer_ctx2ctx_using_param_groups.setdefault(
-                param_groups_with_ctx[0]._reduce_dtype_grad_buffer_ctx, []
-            ).append(param_group)
         for data_buffer_ctx, ctx_using_param_groups in data_buffer_ctx2ctx_using_param_groups.items():
             buffer_size = max(param_group._padded_unsharded_data_size for param_group in ctx_using_param_groups)
             data_buffer_ctx.lazy_init(
                 buffer_size,
                 self._mp_policy.param_dtype,
                 self._device,
-                yccl_handle=yccl_handle.add_all_gather_output_buffer if yccl_handle is not None else None,
+                buffer_type=YaFSDPBufferContext.BufferType.ALL_GATHER,
+                yccl_handle=yccl_handle
+                if data_buffer_ctx2yccl_handle is None
+                else data_buffer_ctx2yccl_handle[data_buffer_ctx],
             )
             for param_group in ctx_using_param_groups:
                 param_group._data_buffer_ctx = data_buffer_ctx
@@ -227,7 +239,10 @@ class YaFSDPState(_State):
                 buffer_size,
                 self._mp_policy.param_dtype,
                 self._device,
-                yccl_handle=yccl_handle.add_reduce_scatter_buffer if yccl_handle is not None else None,
+                buffer_type=YaFSDPBufferContext.BufferType.REDUCE_SCATTER,
+                yccl_handle=yccl_handle
+                if grad_buffer_ctx2yccl_handle is None
+                else grad_buffer_ctx2yccl_handle[grad_buffer_ctx],
             )
             for param_group in ctx_using_param_groups:
                 param_group._grad_buffer_ctx = grad_buffer_ctx
@@ -254,6 +269,20 @@ class YaFSDPState(_State):
             if param_group._grad_buffer_ctx is None:
                 continue
             grad_buffer_ctx2ctx_using_param_groups.setdefault(param_group._grad_buffer_ctx, []).append(param_group)
+        if (num_data_buffers := len(data_buffer_ctx2ctx_using_param_groups)) < min(
+            2, num_param_groups := sum(map(len, data_buffer_ctx2ctx_using_param_groups.values()))
+        ):
+            raise ValueError(
+                "num_data_buffers must be no less than min(2, num_param_groups)"
+                f" for correct overlap, but got {num_data_buffers=} {num_param_groups=}."
+            )
+        if (num_grad_buffers := len(grad_buffer_ctx2ctx_using_param_groups)) < min(
+            2, num_param_groups := sum(map(len, grad_buffer_ctx2ctx_using_param_groups.values()))
+        ):
+            raise ValueError(
+                "num_grad_buffers must be no less than min(2, num_param_groups)"
+                f" for correct overlap, but got {num_grad_buffers=} {num_param_groups=}."
+            )
         for ctx_using_param_groups in data_buffer_ctx2ctx_using_param_groups.values():
             if (
                 len(
@@ -278,7 +307,7 @@ class YaFSDPState(_State):
             ):
                 raise ValueError(
                     "Only one parameter group across groups which share a data buffer"
-                    "is allowed to have no reshard_after_backward"
+                    "is allowed to have no reshard after backward"
                     f", but got {param_groups_with_no_reshard_after_backward=}"
                 )
         for ctx_using_param_groups in grad_buffer_ctx2ctx_using_param_groups.values():
@@ -292,7 +321,7 @@ class YaFSDPState(_State):
             ):
                 raise ValueError(
                     "Only one parameter group across groups which share a grad buffer"
-                    "is allowed to have no grads reduce"
+                    "is allowed to have no grad reduce"
                     f", but got {param_groups_with_no_reduce_grads=}"
                 )
 
@@ -376,7 +405,9 @@ class YaFSDPState(_State):
         with torch.profiler.record_function("YaFSDP::root_post_backward_callback"):
             for state in self._state_ctx.all_states:
                 fsdp_param_group = state._fsdp_param_group
-                if fsdp_param_group and (fsdp_param_group.is_unsharded or not fsdp_param_group.unshard_in_backward):
+                if fsdp_param_group is not None and (
+                    fsdp_param_group.is_unsharded or not fsdp_param_group.unshard_in_backward
+                ):
                     # Run post-backward in case forward inputs did not require
                     # gradient so the autograd backward did not run
                     fsdp_param_group.post_backward()
@@ -385,10 +416,15 @@ class YaFSDPState(_State):
                     fsdp_param_group._training_state = TrainingState.IDLE
                 if self._state_ctx.is_last_backward:
                     state._finalize_backward()
+                if fsdp_param_group is not None:
+                    if (yccl_handle := fsdp_param_group._data_buffer_ctx.yccl_handle) is not None:
+                        yccl_handle.process_profiling_events()
+                    if (grad_buffer_ctx := fsdp_param_group._grad_buffer_ctx) is not None and (
+                        yccl_handle := grad_buffer_ctx.yccl_handle
+                    ) is not None:
+                        yccl_handle.process_profiling_events()
             self._comm_ctx.post_forward_order.clear()
             self._state_ctx.post_backward_final_callback_queued = False
-            if self._comm_ctx.yccl_handle is not None:
-                self._comm_ctx.yccl_handle.process_profiling_events()
 
     def _finalize_backward(self) -> None:
         if self._modules_to_run_forward:
@@ -465,3 +501,29 @@ def _register_group_forward_hooks(
         for module in modules
     ]
     return _MultiHandle(tuple(pre_handles + post_handles))
+
+
+def get_buffer_ctx2ctx_using_param_groups_map(
+    param_groups: list[YaFSDPParamGroup],
+    buffer_ctx_attr_name: str,
+    num_buffers: Optional[int],
+    param_group_to_buffer_ctx_idx: Optional[dict[YaFSDPParamGroup, int]] = None,
+    buffer_ctx_idx_to_yccl_handle: Optional[dict[int, "yccl.Handle"]] = None,
+) -> dict[YaFSDPBufferContext, list[YaFSDPParamGroup]]:
+    if param_group_to_buffer_ctx_idx is None:
+        if num_buffers is None:
+            raise ValueError("num_buffers must be specified if param_group_to_buffer_ctx_idx is not specified.")
+        param_group_to_buffer_ctx_idx = {
+            param_group: index % num_buffers for index, param_group in enumerate(param_groups)
+        }
+    buffer_ctx2ctx_using_param_groups = {}
+    if buffer_ctx_idx_to_yccl_handle is not None:
+        buffer_ctx2yccl_handle = {}
+    for param_group in param_groups:
+        buffer_ctx_idx = param_group_to_buffer_ctx_idx[param_group]
+        buffer_ctx2ctx_using_param_groups.setdefault(
+            (buffer_ctx := getattr(param_groups[buffer_ctx_idx], buffer_ctx_attr_name)), []
+        ).append(param_group)
+        if buffer_ctx_idx_to_yccl_handle is not None:
+            buffer_ctx2yccl_handle[buffer_ctx] = buffer_ctx_idx_to_yccl_handle[buffer_ctx_idx]
+    return buffer_ctx2ctx_using_param_groups, buffer_ctx2yccl_handle if buffer_ctx_idx_to_yccl_handle else None
