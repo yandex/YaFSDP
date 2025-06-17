@@ -1,13 +1,20 @@
+import itertools
+import logging
 from typing import List, Optional, Set, Tuple, Union
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch._logging import warning_once
 from torch.distributed.device_mesh import DeviceMesh, _get_device_handle, init_device_mesh
 from torch.distributed.tensor import DTensor
+from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
-from ._common import FSDPMeshInfo, HSDPMeshInfo
+from ._common import FSDPMeshInfo
+from ._param import ParamModuleInfo, unsafe_setattr_param
 from ._state import _get_module_fsdp_state
+
+logger = logging.getLogger("ya_fsdp")
 
 
 def _get_post_forward_mesh_info(
@@ -31,6 +38,11 @@ def _get_post_forward_mesh_info(
                 f"factor of {shard_mesh_size}, not {reshard_after_forward}"
             )
         elif reshard_after_forward == 1:
+            msg = (
+                "reshard_after_forward=1 (int) means resharding parameters to world size 1, "
+                "instead of reshard_after_forward=True (bool)"
+            )
+            warning_once(logger, msg, stacklevel=2)
             reshard_after_forward = False
         elif reshard_after_forward == shard_mesh_size:
             reshard_after_forward = True
@@ -38,12 +50,7 @@ def _get_post_forward_mesh_info(
     if reshard_after_forward is True:
         post_forward_mesh_info = mesh_info
     elif reshard_after_forward is not False:  # int case
-        # For HSDP, we can flatten the two replicate dims into the 0th dim
-        post_forward_mesh_tensor = mesh_info.mesh.mesh.view(-1, reshard_after_forward)
-        post_forward_mesh = DeviceMesh(mesh_info.mesh.device_type, post_forward_mesh_tensor)
-        post_forward_mesh_info = HSDPMeshInfo(
-            post_forward_mesh, mesh_info.intra_node_group, shard_mesh_dim=1, replicate_mesh_dim=0
-        )
+        raise ValueError("YaFSDP does not support post forward resharding to a smaller world size yet.")
     return post_forward_mesh_info
 
 
@@ -64,7 +71,58 @@ def _get_device_from_mesh(mesh: DeviceMesh) -> torch.device:
     return torch.device(mesh.device_type, device_handle.current_device())
 
 
-def _get_managed_modules(root_modules: Tuple[nn.Module, ...]) -> List[nn.Module]:
+def _ignore_module(
+    module: nn.Module,
+    ignored_params: set[nn.Parameter],
+    ignore_decision: dict[nn.Module, bool],
+) -> bool:
+    """
+    Decide if it is safe to ignore a module for applying fully_shard.
+    """
+    if module in ignore_decision:
+        return ignore_decision[module]
+
+    if len(list(module.buffers(recurse=False))) > 0:
+        # Cannot ignore a module with any buffer
+        ignore_decision[module] = False
+        return False
+
+    for _, param in module.named_parameters(recurse=False):
+        if param not in ignored_params:
+            # at least one param is not ignored. So this module shouldn't be.
+            ignore_decision[module] = False
+            return False
+
+    # Need to consider descendants of module
+    for child in list(module.children()):
+        ignore_child = _ignore_module(child, ignored_params, ignore_decision)
+        if not ignore_child:
+            # Cannot ignore module if one of its children is not ignored
+            ignore_decision[module] = False
+            return False
+
+    # Safe to ignore module
+    ignore_decision[module] = True
+    return True
+
+
+def _adjust_managed_modules(modules: list[nn.Module], ignored_params: set[nn.Parameter]) -> list[nn.Module]:
+    """
+    Adjust the given list of managed modules by removing those with all parameters ignored.
+    """
+    ignore_decision: dict[nn.Module, bool] = {}
+    new_modules = []
+    for module in modules:
+        ignored = _ignore_module(module, ignored_params, ignore_decision)
+        if not ignored:
+            new_modules.append(module)
+    return new_modules
+
+
+def _get_managed_modules(
+    root_modules: Tuple[nn.Module, ...],
+    ignored_params: Optional[set[nn.Parameter]] = None,
+) -> List[nn.Module]:
     modules: List[nn.Module] = []
     root_modules_set = set(root_modules)
     # Track visited modules to avoid visiting shared modules multiple times
@@ -85,7 +143,12 @@ def _get_managed_modules(root_modules: Tuple[nn.Module, ...]) -> List[nn.Module]
 
     for root_module in root_modules:
         dfs(root_module)
-    return modules
+
+    if ignored_params is None:
+        return modules
+
+    adjusted_modules = _adjust_managed_modules(modules, ignored_params)
+    return adjusted_modules
 
 
 def _verify_managed_param(name: str, param: nn.Parameter) -> None:
@@ -101,7 +164,7 @@ def _verify_managed_param(name: str, param: nn.Parameter) -> None:
 
 
 def _get_managed_states(
-    modules: List[nn.Module],
+    modules: List[nn.Module], ignored_params: Optional[set[nn.Parameter]] = None
 ) -> Tuple[List[nn.Parameter], List[torch.Tensor]]:
     params: List[nn.Parameter] = []
     buffers: List[torch.Tensor] = []
@@ -109,8 +172,14 @@ def _get_managed_states(
     # buffers multiple times
     visited_params: Set[nn.Parameter] = set()
     visited_buffers: Set[torch.Tensor] = set()
+    if ignored_params is None:
+        ignored_params = set()
+
     for module in modules:
         for name, param in module.named_parameters(recurse=False):
+            if param in ignored_params:
+                # do not include an ignored parameters
+                continue
             if param not in visited_params:
                 _verify_managed_param(name, param)
                 params.append(param)
@@ -122,21 +191,58 @@ def _get_managed_states(
     return params, buffers
 
 
-def _move_modules_to_device(
-    modules: List[nn.Module],
+def _move_states_to_device(
+    params: list[nn.Parameter],
+    buffers: list[torch.Tensor],
+    param_module_infos: List[ParamModuleInfo],
     device: torch.device,
     param_dtype: Optional[torch.dtype] = None,
 ) -> None:
-    prev_overwrite_module_params_on_conversion = torch.__future__.get_overwrite_module_params_on_conversion()
-    torch.__future__.set_overwrite_module_params_on_conversion(True)
-    for module in modules:
-        module._apply(
-            lambda t: torch.empty_like(t, dtype=param_dtype if isinstance(t, nn.Parameter) else None, device=device)
-            if t.is_meta
-            else t.to(dtype=param_dtype if isinstance(t, nn.Parameter) else None, device=device),
-            recurse=False,
-        )
-    torch.__future__.set_overwrite_module_params_on_conversion(prev_overwrite_module_params_on_conversion)
+    """
+    We have FSDP move states to device for simpler and faster initialization
+    since FSDP almost always uses CUDA for training. We move parameters/buffers
+    rather than modules since modules to support ignoring parameters/buffers in
+    the future.
+    """
+    # Follow the logic in `nn.Module._apply`
+    for tensor, module_info in itertools.chain(
+        zip(params, param_module_infos), zip(buffers, (None for _ in range(len(buffers))))
+    ):
+        if tensor.device == device:
+            continue
+        if isinstance(tensor, DTensor):
+            if (dtensor_mesh_type := tensor.device_mesh.device_type) != device.type:
+                raise ValueError(
+                    "Requires DTensor to have mesh of the same type as the FSDP mesh "
+                    f"but got {dtensor_mesh_type} for DTensor and {device.type} for FSDP"
+                )
+            raise AssertionError(f"Expects DTensor to be moved to {dtensor_mesh_type} but got {tensor.device}")
+        if module_info is not None:
+            if is_traceable_wrapper_subclass(tensor):
+                inner_tensors, flatten_spec = tensor.__tensor_flatten__()
+                inner_tensors = {
+                    attr_name: torch.empty_like(
+                        inner_tensor, dtype=param_dtype if isinstance(tensor, nn.Parameter) else None, device=device
+                    )
+                    if (inner_tensor := getattr(tensor, attr_name)).is_meta
+                    else inner_tensor.to(dtype=param_dtype if isinstance(tensor, nn.Parameter) else None, device=device)
+                    for attr_name in inner_tensors
+                }
+                new_tensor = tensor.__tensor_unflatten__(inner_tensors, flatten_spec, None, None)
+            else:
+                new_tensor = (
+                    torch.empty_like(
+                        tensor, dtype=param_dtype if isinstance(tensor, nn.Parameter) else None, device=device
+                    )
+                    if tensor.is_meta
+                    else tensor.to(dtype=param_dtype if isinstance(tensor, nn.Parameter) else None, device=device)
+                )
+            param = nn.Parameter(new_tensor, requires_grad=tensor.requires_grad)
+            unsafe_setattr_param(module_info.module, module_info.param_name, param)
+            for shared_module, shared_param_name in zip(module_info.shared_modules, module_info.shared_param_names):
+                unsafe_setattr_param(shared_module, shared_param_name, param)
+        else:
+            tensor.data = tensor.to(dtype=param_dtype if isinstance(tensor, nn.Parameter) else None, device=device)
 
 
 def _sync_states(

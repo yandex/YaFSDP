@@ -1,7 +1,7 @@
 import logging
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import List, Optional, cast
+from typing import Any, List, Optional, cast
 
 import torch
 import torch.nn as nn
@@ -9,10 +9,11 @@ from torch._logging import warning_once
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 from torch.distributed.tensor.device_mesh import _mesh_resources
-from torch.distributed.tensor.placement_types import Placement, Shard, _StridedShard
+from torch.distributed.tensor.placement_types import Placement
 
 from ._api import MixedPrecisionPolicy
-from ._common import FSDPMeshInfo, HSDPMeshInfo, TrainingState
+from ._common import FSDPMeshInfo, TrainingState, _raise_assert_with_print
+from ._tensor import YaFSDPDTensor, YaFSDPDTensorSpec, YaFSDPShard, _YaFSDPStridedShard
 
 logger = logging.getLogger("ya_fsdp")
 
@@ -21,17 +22,11 @@ class ShardedState(Enum):
     """
     - ``SHARDED``: The sharded parameter is registered to the module. It is the
       only contributor to parameter memory.
-    - ``SHARDED_POST_FORWARD``: The unsharded parameter is resharded to a
-      smaller world size. Since this data should not be used for computation,
-      we do not register it to the module. Users should reshard the module
-      before any in-place modifications. Both it and the sharded parameter
-      contribute to parameter memory.
     - ``UNSHARDED``: The unsharded parameter is registered to the module. Both
       it and the sharded parameter contribute to parameter memory.
     """
 
     SHARDED = auto()
-    SHARDED_POST_FORWARD = auto()
     UNSHARDED = auto()
 
 
@@ -51,18 +46,32 @@ class ParamModuleInfo:
     shared_param_names: List[str] = field(default_factory=list)
 
 
+@dataclass
+class ExtensionsData:
+    # User-defined metadata passed from pre to post-all-gather
+    all_gather_metadata: Optional[Any] = None
+
+    def clear(self):
+        self.all_gather_metadata = None
+
+
 class YaFSDPParam:
     """
     This class manages a parameter with YaFSDP applied.
     """
 
+    orig_dtype: torch.dtype
+    param_dtype: Optional[torch.dtype]
+    reduce_dtype: Optional[torch.dtype]
     _orig_size: torch.Size
     _orig_numel: int
     sharded_param: nn.Parameter
     _sharded_param_grad: Optional[torch.Tensor]
+    _all_gather_input: Optional[torch.Tensor]
     _unsharded_param: nn.Parameter
     _unsharded_param_grad: Optional[torch.Tensor]
-    _unsharded_params_for_backward: List[nn.Parameter]
+    _all_gather_output: torch.Tensor
+    _unsharded_params_with_post_backward_hook: List[nn.Parameter]
 
     def __init__(
         self,
@@ -105,13 +114,10 @@ class YaFSDPParam:
             assert self._spmd_mesh.ndim == 2, f"_spmd_mesh.ndim can only be 2 but got {self._spmd_mesh.ndim}."
             self._spmd_placements: tuple[Placement, ...]
             dp_shard_tp_placement = (
-                (_StridedShard(0, split_factor=split_factor) if split_factor > 1 else Shard(0)),
+                (_YaFSDPStridedShard(split_factor=split_factor) if split_factor > 1 else YaFSDPShard()),
                 self._tp_spec.placements[0],
             )
-            if self._spmd_mesh.ndim == 2:
-                self._spmd_placements = dp_shard_tp_placement
-            else:
-                raise NotImplementedError("YaFSDP doesn't support HSDP yet.")
+            self._spmd_placements = dp_shard_tp_placement
             self._sharding_spec = DTensorSpec(
                 self._spmd_mesh,
                 self._spmd_placements,
@@ -129,10 +135,7 @@ class YaFSDPParam:
             param_data = cast(DTensor, param)._local_tensor
         else:
             self._spmd_mesh = self.mesh_info.mesh
-            if isinstance(self.mesh_info, HSDPMeshInfo):
-                raise NotImplementedError("YaFSDP doesn't support HSDP yet.")
-            else:
-                self._spmd_placements = (Shard(0),)
+            self._spmd_placements = (YaFSDPShard(),)
             self._sharding_spec = DTensorSpec(
                 self._spmd_mesh,
                 self._spmd_placements,
@@ -145,26 +148,43 @@ class YaFSDPParam:
         self.param_data = param_data
         self._requires_grad = param.requires_grad
 
-        self._unsharded_params_for_backward = []
+        self._unsharded_params_with_post_backward_hook = []
         self._param_fqn: Optional[str] = None  # prefixed from root module
 
     @torch.no_grad()
-    def init_sharded_param(
+    def _init_sharded_param(
         self,
-        sharded_param: torch.Tensor,
+        sharded_param_data: torch.Tensor,
         sharded_param_grad: Optional[torch.Tensor],
+        global_offset: int,
     ):
+        sharded_param = self.param_data.new_zeros((sharded_param_data.numel(),), dtype=sharded_param_data.dtype)
+        if hasattr(sharded_param, "__tensor_flatten__"):
+            inner_tensors = [getattr(sharded_param, attr_name) for attr_name in sharded_param.__tensor_flatten__()[0]]
+        else:
+            inner_tensors = [sharded_param]
+        torch.utils.swap_tensors(inner_tensors[0], sharded_param_data)
+        self._sharding_spec = YaFSDPDTensorSpec(
+            self._sharding_spec.mesh,
+            self._sharding_spec.placements,
+            tensor_meta=self._sharding_spec.tensor_meta,
+            local_numel=sharded_param.numel(),
+            global_offset=global_offset,
+        )
         self.sharded_param = nn.Parameter(
-            DTensor(
+            YaFSDPDTensor(
                 sharded_param,
                 self._sharding_spec,
                 requires_grad=False,
             ),
             requires_grad=self._requires_grad,
         )
+        self._setattr_on_modules(self.sharded_param)
+        self.sharded_state = ShardedState.SHARDED
+        self._init_extensions()
         if self._requires_grad:
             assert sharded_param_grad is not None
-            self._sharded_param_grad = DTensor(
+            self._sharded_param_grad = YaFSDPDTensor(
                 sharded_param_grad,
                 self._sharding_spec,
                 requires_grad=False,
@@ -173,14 +193,11 @@ class YaFSDPParam:
             self._sharded_param_grad = None
         del self.param_data
 
-        self._setattr_on_modules(self.sharded_param)
-        self.sharded_state = ShardedState.SHARDED
-
     def set_sharded_param_grad(self):
         self.sharded_param.grad = self._sharded_param_grad
 
     def init_dtype_attrs(self, mp_policy: MixedPrecisionPolicy):
-        param_dtype, reduce_dtype = mp_policy.param_dtype, mp_policy.reduce_dtype
+        param_dtype, reduce_dtype = (mp_policy.param_dtype, mp_policy.reduce_dtype)
         self.orig_dtype = self.param_data.dtype
         # Clamp `reduce_dtype` to `None` if no casting is required: since
         # gradients are computed in `param_dtype`, if `reduce_dtype` matches,
@@ -194,52 +211,69 @@ class YaFSDPParam:
         self.reduce_dtype = reduce_dtype
         # None indicates that the mixed precision is not enabled
 
-    @torch.no_grad()
-    def init_unsharded_param(
-        self, padded_unsharded_data: torch.Tensor, padded_unsharded_grad: Optional[torch.Tensor], offset: int
-    ):
-        unsharded_param = padded_unsharded_data.narrow(0, offset, self._orig_numel).view(self._orig_size)
-        if self.is_dtensor:
-            unsharded_param = DTensor(unsharded_param, self._tp_spec, requires_grad=False)
-        self._unsharded_param = nn.Parameter(
-            unsharded_param,
-            requires_grad=self.sharded_param.requires_grad,
-        )
+    def _init_extensions(self) -> None:
+        inner_tensor = self._sharded_local_tensor
+        has_fsdp_pre_all_gather = hasattr(inner_tensor, "fsdp_pre_all_gather")
+        has_fsdp_post_all_gather = hasattr(inner_tensor, "fsdp_post_all_gather")
+        if has_fsdp_pre_all_gather != has_fsdp_post_all_gather:
+            raise AssertionError(
+                "Both fsdp_pre_all_gather and fsdp_post_all_gather should be defined "
+                f"if using all-gather extensions: {inner_tensor}"
+            )
+        if has_fsdp_pre_all_gather:
+            self._extensions_data = ExtensionsData()
+
+    def init_all_gather_input(self, all_gather_input: torch.Tensor):
+        self._all_gather_input = all_gather_input
+
+    def init_all_gather_output(self, all_gather_output: torch.Tensor, unsharded_param_grad: Optional[torch.Tensor]):
+        self._all_gather_output = all_gather_output.view(self._orig_size)
         if self.sharded_param.requires_grad:
-            assert padded_unsharded_grad is not None
-            unsharded_param_grad = padded_unsharded_grad.narrow(0, offset, self._orig_numel).view(self._orig_size)
+            assert unsharded_param_grad is not None
+            unsharded_param_grad = unsharded_param_grad.view(self._orig_size)
             if self.is_dtensor:
                 unsharded_param_grad = DTensor(unsharded_param_grad, self._tp_spec, requires_grad=False)
             self._unsharded_param_grad = unsharded_param_grad
         else:
             self._unsharded_param_grad = None
 
-    def to_sharded(self) -> None:
+    def init_unsharded_param(self):
+        inner_tensor = self._sharded_local_tensor
+        if hasattr(inner_tensor, "fsdp_post_all_gather"):
+            unsharded_param, _ = inner_tensor.fsdp_post_all_gather(
+                (self._all_gather_output,),
+                self._extensions_data.all_gather_metadata,
+                self.param_dtype or self.orig_dtype,
+            )
+        else:
+            unsharded_param = self._all_gather_output
+        if self.is_dtensor:
+            unsharded_param = DTensor(unsharded_param, self._tp_spec, requires_grad=False)
+        self._unsharded_param = nn.Parameter(
+            unsharded_param,
+            requires_grad=self.sharded_param.requires_grad,
+        )
+
+    def to_sharded(self, training_state: Optional[TrainingState] = None) -> None:
         self._setattr_on_modules(self.sharded_param)
         self.sharded_state = ShardedState.SHARDED
 
-    # def to_sharded_post_forward(self) -> None:
-    #     self._setattr_on_modules(self._sharded_post_forward_param)
-    #     self.free_unsharded_param()
-    #     self.sharded_state = ShardedState.SHARDED_POST_FORWARD
-
     def to_unsharded(self, training_state: Optional[TrainingState] = None) -> None:
         # Assume that the data has been allocated and all-gathered
-        if training_state == TrainingState.FORWARD and torch.is_grad_enabled() and self.sharded_param.requires_grad:
-            unsharded_param = self._unsharded_params_for_backward[-1]
-        elif training_state == TrainingState.PRE_BACKWARD and self.sharded_param.requires_grad:
-            unsharded_param = self._unsharded_params_for_backward.pop()
+        if self.sharded_param.requires_grad and (
+            (training_state == TrainingState.FORWARD and torch.is_grad_enabled())
+            or training_state == TrainingState.PRE_BACKWARD
+        ):
+            unsharded_param = self._unsharded_params_with_post_backward_hook[-1]
         else:
             unsharded_param = self._unsharded_param
         self._setattr_on_modules(unsharded_param)
-        # if self.sharded_state == ShardedState.SHARDED_POST_FORWARD:
-        #     # The data is allocated in the default stream via the post-forward
-        #     # reshard and must be kept alive for the next all-gather copy-in.
-        #     # Since we call this method after the copy-out, the data's lifetime
-        #     # is ensured without further synchronization.
-        #     self._sharded_post_forward_param = None
-        #     self._sharded_post_forward_param_data = None  # free
         self.sharded_state = ShardedState.UNSHARDED
+
+    def register_unsharded_param_with_post_backward_hook(self, unsharded_param: nn.Parameter):
+        unsharded_param = _PatchGradAccumulation.apply(self, unsharded_param)
+        unsharded_param._is_param = True
+        self._unsharded_params_with_post_backward_hook.append(cast(nn.Parameter, unsharded_param))
 
     def _setattr_on_modules(self, param: nn.Parameter) -> None:
         unsafe_setattr_param(self._module_info.module, self._module_info.param_name, param)
@@ -247,6 +281,50 @@ class YaFSDPParam:
             self._module_info.shared_modules, self._module_info.shared_param_names
         ):
             unsafe_setattr_param(shared_module, shared_param_name, param)
+
+    def set_all_gather_input(self):
+        self._assert_in_states(ShardedState.SHARDED)
+        if hasattr(self._sharded_local_tensor, "fsdp_pre_all_gather"):
+            sharded_local_tensor = self._sharded_local_tensor
+            (
+                all_gather_inputs,
+                self._extensions_data.all_gather_metadata,
+            ) = sharded_local_tensor.fsdp_pre_all_gather(self.shard_mesh_from_root)
+            assert len(all_gather_inputs) == 1
+            all_gather_input = next(iter(all_gather_inputs))
+            assert self._all_gather_input is not None
+            self._all_gather_input.copy_(all_gather_input)
+
+    @property
+    def _sharded_local_tensor(self) -> torch.Tensor:
+        return cast(DTensor, self.sharded_param)._local_tensor
+
+    @property
+    def shard_mesh(self):
+        mesh = self.mesh_info.mesh
+        if mesh.ndim == 1:
+            return mesh
+        elif mesh.ndim == 2:
+            assert mesh.mesh_dim_names is not None
+            return mesh[mesh.mesh_dim_names[-1]]
+        raise ValueError(f"Invalid mesh: {mesh}")
+
+    @property
+    def shard_mesh_from_root(self):
+        mesh = self.mesh_info.mesh
+
+        if mesh.ndim == 1:
+            return mesh
+        else:
+            assert mesh.mesh_dim_names is not None
+            shard_dim_name = mesh.mesh_dim_names[-1]
+
+            root_mesh = _mesh_resources.get_root_mesh(mesh)
+            return root_mesh[shard_dim_name]
+
+    def _assert_in_states(self, *states: ShardedState) -> None:
+        if self.sharded_state not in states:
+            _raise_assert_with_print(f"Expects to be in one of {states}, not {self.sharded_state}")
 
     def __repr__(self):
         return f"YaFSDPParam(fqn={self._param_fqn}, orig_size={self._orig_size})"
@@ -263,3 +341,23 @@ def unsafe_setattr_param(module: nn.Module, param_name: str, param: nn.Parameter
         msg = f"{module.__class__} defines a custom __setattr__ which YaFSDP does not support."
         warning_once(logger, msg, stacklevel=2)
     module._parameters[param_name] = param
+
+
+class _PatchGradAccumulation(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, fsdp_param: YaFSDPParam, unsharded_param: nn.Parameter):
+        ctx.fsdp_param = fsdp_param
+        ctx.set_materialize_grads(False)
+        return unsharded_param
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        fsdp_param: YaFSDPParam = ctx.fsdp_param
+        if grad is None:
+            return None, None
+        if fsdp_param._unsharded_param.grad is None:
+            fsdp_param._unsharded_param.grad = fsdp_param._unsharded_param_grad
+            fsdp_param._unsharded_param.grad.copy_(grad)
+        else:
+            fsdp_param._unsharded_param.grad += grad
+        return None, None

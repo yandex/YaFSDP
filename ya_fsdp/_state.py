@@ -1,6 +1,6 @@
 import functools
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, TypeVar
 
 import torch
 import torch.nn as nn
@@ -104,7 +104,7 @@ class YaFSDPState(_State):
                 self._comm_ctx.all_gather_stream.wait_stream(current_stream)
             if self._device.type == "cuda":
                 with torch.profiler.record_function("YaFSDP::inputs_to_device"):
-                    args_tuple, kwargs_tuple = _to_kwargs(args, kwargs, self._device, False)
+                    args_tuple, kwargs_tuple = _to_kwargs(args, kwargs, self._device, False)  # same as DDP
                 args, kwargs = args_tuple[0], kwargs_tuple[0]
         return args, kwargs
 
@@ -130,7 +130,6 @@ class YaFSDPState(_State):
             raise RuntimeError(f"YaFSDP requires a single root module but got {self._modules}")
         root_module = self._modules[0]
         visited_states: Set[YaFSDPState] = set()
-        all_states: List[YaFSDPState] = []
         for module_name, module in root_module.named_modules():
             if (state := _get_module_fsdp_state(module)) is None:
                 continue
@@ -142,20 +141,10 @@ class YaFSDPState(_State):
                         "the root module first"
                     )
                 state._is_root = False
-            all_states.append(state)
+            if state not in visited_states:
+                self._state_ctx.all_states.append(state)
             visited_states.add(state)
-        for prev_state, state in zip([None, *all_states[:-1]], all_states):
-            if prev_state is not None and state is prev_state:
-                continue
-            self._state_ctx.all_states.append(state)
-        assert len(visited_states) == len(self._state_ctx.all_states)
         self._init_fqns()
-        if self._fsdp_param_group and len(self._state_ctx.all_states) > 1:
-            raise RuntimeError(
-                "YaFSDP requires root module to be the only sharded module or to have no parameters"
-                ", but root module got parameters"
-                f" {[fsdp_param._param_fqn for fsdp_param in self._fsdp_param_group.fsdp_params]}"
-            )
         self._init_shared_state(
             allow_no_grad_reduce,
             yccl_handle,
@@ -216,13 +205,37 @@ class YaFSDPState(_State):
             1,
         )
 
+        T = TypeVar("T")
+
+        def max_across_dict(dict_list: List[Dict[T, int]]) -> dict[T, int]:
+            max_dict = {}
+            for d in dict_list:
+                for k, v in d.items():
+                    if k in max_dict:
+                        max_dict[k] = max(max_dict[k], v)
+                    else:
+                        max_dict[k] = v
+            return max_dict
+
         for data_buffer_ctx, ctx_using_param_groups in data_buffer_ctx2ctx_using_param_groups.items():
-            buffer_size = max(param_group._padded_unsharded_data_size for param_group in ctx_using_param_groups)
+            padded_unsharded_param_sizes = [
+                param_group._padded_unsharded_param_size for param_group in ctx_using_param_groups
+            ]
+            buffer_size = (max if isinstance(next(iter(padded_unsharded_param_sizes)), int) else max_across_dict)(
+                padded_unsharded_param_sizes
+            )
+            param_dtypes = {
+                param_group._param_dtype or param_group._orig_dtype for param_group in ctx_using_param_groups
+            }
+            if len(param_dtypes) != 1:
+                raise AssertionError(
+                    f"YaFSDP expects uniform param dtype across YaFSDPParamGroups which share a data buffer but got {param_dtypes}"
+                )
+            param_dtype = next(iter(param_dtypes))
             data_buffer_ctx.lazy_init(
                 buffer_size,
-                self._mp_policy.param_dtype,
+                param_dtype,
                 self._device,
-                buffer_type=YaFSDPBufferContext.BufferType.ALL_GATHER,
                 yccl_handle=yccl_handle
                 if data_buffer_ctx2yccl_handle is None
                 else data_buffer_ctx2yccl_handle[data_buffer_ctx],
@@ -234,12 +247,24 @@ class YaFSDPState(_State):
             # freed and all-gathered immediately
             ctx_using_param_groups[-1].post_forward_mesh_info = None
         for grad_buffer_ctx, ctx_using_param_groups in grad_buffer_ctx2ctx_using_param_groups.items():
-            buffer_size = max(param_group._padded_unsharded_data_size for param_group in ctx_using_param_groups)
+            padded_unsharded_param_sizes = [
+                param_group._padded_unsharded_param_size for param_group in ctx_using_param_groups
+            ]
+            buffer_size = (max if isinstance(next(iter(padded_unsharded_param_sizes)), int) else max_across_dict)(
+                padded_unsharded_param_sizes
+            )
+            param_dtypes = {
+                param_group._param_dtype or param_group._orig_dtype for param_group in ctx_using_param_groups
+            }
+            if len(param_dtypes) != 1:
+                raise AssertionError(
+                    f"YaFSDP expects uniform param dtype across YaFSDPParamGroups which share a grad buffer but got {param_dtypes}"
+                )
+            param_dtype = next(iter(param_dtypes))
             grad_buffer_ctx.lazy_init(
                 buffer_size,
-                self._mp_policy.param_dtype,
+                param_dtype,
                 self._device,
-                buffer_type=YaFSDPBufferContext.BufferType.REDUCE_SCATTER,
                 yccl_handle=yccl_handle
                 if grad_buffer_ctx2yccl_handle is None
                 else grad_buffer_ctx2yccl_handle[grad_buffer_ctx],
@@ -250,10 +275,21 @@ class YaFSDPState(_State):
             reduce_dtype_grad_buffer_ctx,
             ctx_using_param_groups,
         ) in reduce_dtype_grad_buffer_ctx2ctx_using_param_groups.items():
-            buffer_size = max(param_group._padded_unsharded_data_size for param_group in ctx_using_param_groups)
+            padded_unsharded_param_sizes = [
+                param_group._padded_unsharded_param_size for param_group in ctx_using_param_groups
+            ]
+            buffer_size = (max if isinstance(next(iter(padded_unsharded_param_sizes)), int) else max_across_dict)(
+                padded_unsharded_param_sizes
+            )
+            reduce_dtypes = {param_group._reduce_dtype for param_group in ctx_using_param_groups}
+            if len(reduce_dtypes) != 1:
+                raise AssertionError(
+                    f"YaFSDP expects uniform reduce dtype across YaFSDPParamGroups which share a reduce dtype grad buffer but got {param_dtypes}"
+                )
+            reduce_dtype = next(iter(reduce_dtypes))
             reduce_dtype_grad_buffer_ctx.lazy_init(
                 buffer_size,
-                self._mp_policy.reduce_dtype,
+                reduce_dtype,
                 self._device,
             )
             for param_group in ctx_using_param_groups:
@@ -294,7 +330,7 @@ class YaFSDPState(_State):
             ):
                 raise ValueError(
                     "Only one parameter group across groups which share a data buffer"
-                    "is allowed to have no reshard after forward"
+                    " is allowed to have no reshard after forward"
                     f", but got {param_groups_with_no_reshard_after_forward=}"
                 )
             if (
@@ -307,7 +343,7 @@ class YaFSDPState(_State):
             ):
                 raise ValueError(
                     "Only one parameter group across groups which share a data buffer"
-                    "is allowed to have no reshard after backward"
+                    " is allowed to have no reshard after backward"
                     f", but got {param_groups_with_no_reshard_after_backward=}"
                 )
         for ctx_using_param_groups in grad_buffer_ctx2ctx_using_param_groups.values():
@@ -324,6 +360,43 @@ class YaFSDPState(_State):
                     "is allowed to have no grad reduce"
                     f", but got {param_groups_with_no_reduce_grads=}"
                 )
+        data_buffer_ctx2module_prefix: Dict[YaFSDPBufferContext] = {}
+        grad_buffer_ctx2module_prefix: Dict[YaFSDPBufferContext] = {}
+        state2modules_to_run_forward: Dict[YaFSDPState, Set[nn.Module]] = {}
+
+        def validate_buffers(module: nn.Module, prefix: str = ""):
+            if (state := _get_module_fsdp_state(module)) is not None and (
+                param_group := state._fsdp_param_group
+            ) is not None:
+                if state not in state2modules_to_run_forward:
+                    state2modules_to_run_forward[state] = set(state._modules)
+                    if (data_buffer_ctx := param_group._data_buffer_ctx) in data_buffer_ctx2module_prefix:
+                        raise RuntimeError(
+                            f"Param groups of {prefix} and {data_buffer_ctx2module_prefix[data_buffer_ctx]} share a"
+                            " data buffer, so they can't be unsharded at the same time."
+                        )
+                    data_buffer_ctx2module_prefix[data_buffer_ctx] = prefix
+                    if grad_buffer_ctx := param_group._grad_buffer_ctx is not None:
+                        if (grad_buffer_ctx := param_group._grad_buffer_ctx) in grad_buffer_ctx2module_prefix:
+                            raise RuntimeError(
+                                f"Param groups of {prefix} and {grad_buffer_ctx2module_prefix[grad_buffer_ctx]} share a"
+                                " grad buffer, so they can't be unsharded at the same time."
+                            )
+                        grad_buffer_ctx2module_prefix[grad_buffer_ctx] = prefix
+            for submodule_name, submodule in module.named_children():
+                validate_buffers(submodule, prefix + ("." if prefix else "") + submodule_name)
+            if (state := _get_module_fsdp_state(module)) is not None and (
+                param_group := state._fsdp_param_group
+            ) is not None:
+                modules_to_run_forward = state2modules_to_run_forward[state]
+                modules_to_run_forward.remove(module)
+                if len(modules_to_run_forward) == 0:
+                    del data_buffer_ctx2module_prefix[param_group._data_buffer_ctx]
+                    if (grad_buffer_ctx := param_group._grad_buffer_ctx) is not None:
+                        del grad_buffer_ctx2module_prefix[grad_buffer_ctx]
+
+        root_module = self._modules[0]
+        validate_buffers(root_module)
 
     def _init_fqns(self) -> None:
         """Sets module and parameter FQN attributes for debugging."""
@@ -405,9 +478,7 @@ class YaFSDPState(_State):
         with torch.profiler.record_function("YaFSDP::root_post_backward_callback"):
             for state in self._state_ctx.all_states:
                 fsdp_param_group = state._fsdp_param_group
-                if fsdp_param_group is not None and (
-                    fsdp_param_group.is_unsharded or not fsdp_param_group.unshard_in_backward
-                ):
+                if fsdp_param_group and fsdp_param_group._training_state != TrainingState.POST_BACKWARD:
                     # Run post-backward in case forward inputs did not require
                     # gradient so the autograd backward did not run
                     fsdp_param_group.post_backward()

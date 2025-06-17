@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 
@@ -12,6 +12,7 @@ class MixedPrecisionPolicy:
     output_dtype: Optional[torch.dtype] = None
     cast_forward_inputs: bool = False
     bit32_acc_for_bit16_reduce_scatter: bool = False
+    all_gather_dtype_to_param_cls: Optional[Dict[torch.dtype, type]] = None
 
     def __post_init__(self):
         if self.bit32_acc_for_bit16_reduce_scatter and not (self.param_dtype == self.reduce_dtype == torch.bfloat16):

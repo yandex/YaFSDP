@@ -31,6 +31,7 @@
   "ya_fsdp/_param.py":"ml/torch/ya-fsdp/ya_fsdp/_param.py",
   "ya_fsdp/_param_group.py":"ml/torch/ya-fsdp/ya_fsdp/_param_group.py",
   "ya_fsdp/_state.py":"ml/torch/ya-fsdp/ya_fsdp/_state.py",
+  "ya_fsdp/_tensor.py":"ml/torch/ya-fsdp/ya_fsdp/_tensor.py",
   "ya_fsdp/fully_shard.py":"ml/torch/ya-fsdp/ya_fsdp/fully_shard.py",
   "ya_fsdp/meta_param.py":"ml/torch/ya-fsdp/ya_fsdp/meta_param.py",
   "ya_fsdp/ya_fsdp.py":"ml/torch/ya-fsdp/ya_fsdp/ya_fsdp.py"

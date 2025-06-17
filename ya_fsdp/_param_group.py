@@ -35,16 +35,18 @@ class YaFSDPBufferContext:
         ALL_GATHER = auto()
         REDUCE_SCATTER = auto()
 
+    def __init__(self, buffer_type: Optional[BufferType] = None, **kwargs):
+        self._buffer_type = buffer_type
+
     def lazy_init(
         self,
         buffer_size: int,
         dtype: torch.dtype,
         device: torch.device,
-        buffer_type: Optional[BufferType] = None,
         yccl_handle: Optional["yccl.Handle"] = None,
     ):
-        if yccl_handle is not None and dtype != torch.bfloat16:
-            raise RuntimeError("YCCL requires param_dtype and reduce_dtype to be bfloat16")
+        if yccl_handle is not None and self._buffer_type == self.BufferType.REDUCE_SCATTER and dtype != torch.bfloat16:
+            raise RuntimeError("YCCL requires reduce_dtype to be bfloat16")
         self.buffer = (
             torch.empty(buffer_size, dtype=dtype, device=device)
             if yccl_handle is None
@@ -53,8 +55,8 @@ class YaFSDPBufferContext:
                 {
                     self.BufferType.ALL_GATHER: "add_all_gather_output_buffer",
                     self.BufferType.REDUCE_SCATTER: "add_reduce_scatter_buffer",
-                }[buffer_type],
-            )(buffer_size)
+                }[self._buffer_type],
+            )(buffer_size * torch.finfo(dtype).bits // torch.finfo(torch.bfloat16).bits).view(dtype)
         )
         self.owner: Optional[YaFSDPParamGroup] = None
         self.release_event: Optional[torch.Event] = None
@@ -66,6 +68,9 @@ class YaFSDPCommContext:
 
     def lazy_init(self, device: torch.device):
         self.device_handle = _get_device_handle(device.type)
+        # Setting the all-gather/reduce-scatter streams to be higher priority
+        # can help avoid some issues where their copies in/out are delayed and
+        # block computation (this is different from high-pri NCCL streams)
         high_priority = -1
         # All-gather stream allows overlapping next all-gather with current
         # forward compute
@@ -73,6 +78,7 @@ class YaFSDPCommContext:
         # Reduce-scatter stream gives separate execution "thread" for post-
         # backward logic like pre/post-gradient division and reduce-scatter
         self.reduce_scatter_stream = self.all_gather_stream
+        # Post-forward order for explicit backward prefetching
         self.post_forward_order: List[YaFSDPParamGroup] = []  # will cause ref cycles
 
     def get_all_gather_stream(self, training_state: TrainingState) -> torch.Stream:
@@ -86,14 +92,17 @@ class YaFSDPParamGroup:
     """This class represents a parameter group to communicate together."""
 
     _orig_dtype: torch.dtype
-    _padded_unsharded_data_size: int
-    _unsharded_data_offsets: List[int]
+    _param_dtype: Optional[torch.dtype]
+    _reduce_dtype: Optional[torch.dtype]
+    _all_gather_dtype: Optional[torch.dtype]
+    _padded_unsharded_param_size: int
+    _unsharded_param_numels: List[int]
     _padded_sharded_param_data: torch.Tensor
-    _padded_sharded_param_data_param_dtype: Optional[torch.Tensor]
+    _all_gather_input: torch.Tensor
     _padded_sharded_param_grad: Optional[torch.Tensor]
-    _unsharded_param_data: torch.Tensor
-    _unsharded_param_grad: Optional[torch.Tensor]
-    _unsharded_param_grad_reduce_dtype: Optional[torch.Tensor]
+    _all_gather_output: torch.Tensor
+    _padded_unsharded_param_grad: Optional[torch.Tensor]
+    _padded_unsharded_param_grad_reduce_dtype: Optional[torch.Tensor]
 
     def __init__(
         self,
@@ -107,6 +116,7 @@ class YaFSDPParamGroup:
     ):
         self.modules = modules  # permit ref cycle because 1:1 lifetime
         param_module_infos = _get_param_module_infos(params, modules)
+
         self.fsdp_params = [
             YaFSDPParam(
                 param,
@@ -154,10 +164,16 @@ class YaFSDPParamGroup:
         self._init_mp_dtypes()
         param_group_requires_grad = any(param.requires_grad for param in params)
 
-        self._data_buffer_ctx = YaFSDPBufferContext()
-        self._grad_buffer_ctx = YaFSDPBufferContext() if param_group_requires_grad else None
+        self._data_buffer_ctx = YaFSDPBufferContext(buffer_type=YaFSDPBufferContext.BufferType.ALL_GATHER)
+        self._grad_buffer_ctx = (
+            YaFSDPBufferContext(buffer_type=YaFSDPBufferContext.BufferType.REDUCE_SCATTER)
+            if param_group_requires_grad
+            else None
+        )
         self._reduce_dtype_grad_buffer_ctx = (
-            YaFSDPBufferContext() if param_group_requires_grad and self._reduce_dtype is not None else None
+            YaFSDPBufferContext(buffer_type=YaFSDPBufferContext.BufferType.REDUCE_SCATTER)
+            if param_group_requires_grad and self._reduce_dtype is not None
+            else None
         )
 
         self._state_dict_type: StateDictType = StateDictType.SHARDED_STATE_DICT
@@ -165,73 +181,125 @@ class YaFSDPParamGroup:
 
         shard_world_size = self.mesh_info.shard_mesh_size
 
-        unsharded_data_numels = [fsdp_param.param_data.numel() for fsdp_param in self.fsdp_params]
-        self._unsharded_data_offsets = [0, *torch.cumsum(torch.tensor(unsharded_data_numels[:-1]), 0).tolist()]
+        self._unsharded_param_numels = [fsdp_param.param_data.numel() for fsdp_param in self.fsdp_params]
 
-        padded_unsharded_data_size = sum(unsharded_data_numels)
+        padded_unsharded_param_size = sum(self._unsharded_param_numels)
         divider = shard_world_size * shard_alignment
-        if padded_unsharded_data_size % divider != 0:
-            padded_unsharded_data_size += divider - padded_unsharded_data_size % divider
-        self._padded_unsharded_data_size = padded_unsharded_data_size
+        if padded_unsharded_param_size % divider != 0:
+            padded_unsharded_param_size += divider - padded_unsharded_param_size % divider
+        self._padded_unsharded_param_size = padded_unsharded_param_size
 
         self._padded_sharded_param_data = torch.empty(
-            padded_unsharded_data_size // shard_world_size, dtype=self._orig_dtype, device=device
+            padded_unsharded_param_size // shard_world_size, dtype=self._orig_dtype, device=device
         )
-        self._padded_sharded_param_data_param_dtype = (
-            self._padded_sharded_param_data.to(self._param_dtype) if self._param_dtype is not None else None
+
+        self._all_gather_input = (
+            self._padded_sharded_param_data
+            if self._param_dtype is None and self._all_gather_dtype is None
+            else torch.empty_like(self._padded_sharded_param_data, dtype=self._all_gather_dtype or self._param_dtype)
         )
+        self._is_all_gather_input_set = False
         self._padded_sharded_param_grad = (
             torch.zeros_like(self._padded_sharded_param_data) if param_group_requires_grad else None
         )
 
-        padded_unsharded_data = torch.empty(padded_unsharded_data_size, dtype=self._orig_dtype, device=device)
-        assert len(self.fsdp_params) < (max_indices_dtype_value := torch.iinfo((indices_dtype := torch.uint16)).max)
-        padded_unsharded_data_indices = torch.full_like(
-            padded_unsharded_data, fill_value=max_indices_dtype_value, dtype=indices_dtype
+        padded_unsharded_param_data = torch.empty(padded_unsharded_param_size, dtype=self._orig_dtype, device=device)
+        assert len(self.fsdp_params) < (
+            max_param_indices_dtype_value := torch.iinfo((param_indices_dtype := torch.uint16)).max
         )
-        for i, (fsdp_param, offset, numel) in enumerate(
-            zip(self.fsdp_params, self._unsharded_data_offsets, unsharded_data_numels)
+        assert max(self._unsharded_param_numels) < (
+            max_element_indices_dtype_value := torch.iinfo((element_indices_dtype := torch.int64)).max
+        )
+        padded_unsharded_param_indices = torch.full_like(
+            padded_unsharded_param_data, fill_value=max_param_indices_dtype_value, dtype=param_indices_dtype
+        )
+        padded_unsharded_param_element_indices = torch.full_like(
+            padded_unsharded_param_data, fill_value=max_element_indices_dtype_value, dtype=element_indices_dtype
+        )
+        for param_index, (
+            fsdp_param,
+            unsharded_param_numel,
+            unsharded_param_data,
+            unsharded_param_indices,
+            unsharded_param_element_indices,
+        ) in enumerate(
+            zip(
+                self.fsdp_params,
+                self._unsharded_param_numels,
+                padded_unsharded_param_data[: sum(self._unsharded_param_numels)].split(self._unsharded_param_numels),
+                padded_unsharded_param_indices[: sum(self._unsharded_param_numels)].split(self._unsharded_param_numels),
+                padded_unsharded_param_element_indices[: sum(self._unsharded_param_numels)].split(
+                    self._unsharded_param_numels
+                ),
+            )
         ):
-            padded_unsharded_data[offset : offset + numel] = fsdp_param.param_data.view(-1)
-            padded_unsharded_data_indices[offset : offset + numel] = i
+            unsharded_param_data.copy_(fsdp_param.param_data.view(-1))
+            unsharded_param_indices.copy_(param_index)
+            unsharded_param_element_indices.copy_(
+                torch.arange(unsharded_param_numel, dtype=element_indices_dtype, device=device)
+            )
 
         shard_rank = self.mesh_info.shard_mesh_rank
 
-        self._padded_sharded_param_data.copy_(torch.chunk(padded_unsharded_data, shard_world_size)[shard_rank])
-        if self._padded_sharded_param_data_param_dtype is not None:
-            self._padded_sharded_param_data_param_dtype.copy_(self._padded_sharded_param_data)
+        self._padded_sharded_param_data.copy_(torch.chunk(padded_unsharded_param_data, shard_world_size)[shard_rank])
 
-        padded_sharded_data_indices = torch.chunk(padded_unsharded_data_indices, shard_world_size)[shard_rank]
-
-        sharded_data_numels = [
-            cast(int, padded_sharded_data_indices.eq(index).sum().item()) for index, _ in enumerate(self.fsdp_params)
+        padded_sharded_param_indices = torch.chunk(padded_unsharded_param_indices, shard_world_size)[shard_rank]
+        padded_sharded_param_element_indices = torch.chunk(padded_unsharded_param_element_indices, shard_world_size)[
+            shard_rank
         ]
-        sharded_data_offsets = [0, *torch.cumsum(torch.tensor(sharded_data_numels[:-1]), 0).tolist()]
 
-        for fsdp_param, offset, numel in zip(self.fsdp_params, sharded_data_offsets, sharded_data_numels):
-            fsdp_param.init_sharded_param(
-                self._padded_sharded_param_data.narrow(0, offset, numel),
-                self._padded_sharded_param_grad.narrow(0, offset, numel)
-                if self._padded_sharded_param_grad is not None
-                else None,
+        self._sharded_param_numels = [
+            cast(int, padded_sharded_param_indices.eq(index).sum().item()) for index, _ in enumerate(self.fsdp_params)
+        ]
+        first_nonzero_local_numel_index = next(
+            (index for index, numel in enumerate(self._sharded_param_numels) if numel > 0), -1
+        )
+        sharded_data_global_offsets = [
+            (
+                cast(int, element_indices.min().item())
+                if (
+                    element_indices := padded_sharded_param_element_indices[padded_sharded_param_indices.eq(index)]
+                ).numel()
+                > 0
+                else (0 if index < first_nonzero_local_numel_index else self._unsharded_param_numels[index])
             )
+            for index in range(len(self.fsdp_params))
+        ]
+
+        for fsdp_param, sharded_param_data, sharded_param_grad, global_offset in zip(
+            self.fsdp_params,
+            self._padded_sharded_param_data[: sum(self._sharded_param_numels)].split(self._sharded_param_numels),
+            (
+                self._padded_sharded_param_grad[: sum(self._sharded_param_numels)].split(self._sharded_param_numels)
+                if self._padded_sharded_param_grad is not None
+                else (None,) * len(self._sharded_param_numels)
+            ),
+            sharded_data_global_offsets,
+        ):
+            fsdp_param._init_sharded_param(sharded_param_data, sharded_param_grad, global_offset=global_offset)
 
     # Initialization #
     def _init_unsharded_params(self):
-        self._unsharded_param_data = self._data_buffer_ctx.buffer.narrow(0, 0, self._padded_unsharded_data_size)
-        self._unsharded_param_grad = (
-            self._grad_buffer_ctx.buffer.narrow(0, 0, self._padded_unsharded_data_size)
+        self._all_gather_output = self._data_buffer_ctx.buffer.narrow(0, 0, self._padded_unsharded_param_size)
+        self._padded_unsharded_param_grad = (
+            self._grad_buffer_ctx.buffer.narrow(0, 0, self._padded_unsharded_param_size)
             if self._grad_buffer_ctx is not None
             else None
         )
-        self._unsharded_param_grad_reduce_dtype = (
-            self._reduce_dtype_grad_buffer_ctx.buffer.narrow(0, 0, self._padded_unsharded_data_size)
+        self._padded_unsharded_param_grad_reduce_dtype = (
+            self._reduce_dtype_grad_buffer_ctx.buffer.narrow(0, 0, self._padded_unsharded_param_size)
             if self._reduce_dtype_grad_buffer_ctx is not None
             else None
         )
 
-        for fsdp_param, offset in zip(self.fsdp_params, self._unsharded_data_offsets):
-            fsdp_param.init_unsharded_param(self._unsharded_param_data, self._unsharded_param_grad, offset)
+        for fsdp_param, all_gather_output, unsharded_param_grad in zip(
+            self.fsdp_params,
+            self._all_gather_output[: sum(self._unsharded_param_numels)].split(self._unsharded_param_numels),
+            self._padded_unsharded_param_grad[: sum(self._unsharded_param_numels)].split(self._unsharded_param_numels)
+            if self._padded_unsharded_param_grad is not None
+            else (None,) * len(self._unsharded_param_numels),
+        ):
+            fsdp_param.init_all_gather_output(all_gather_output, unsharded_param_grad)
 
     def _init_mp_dtypes(self) -> None:
         for fsdp_param in self.fsdp_params:
@@ -249,6 +317,13 @@ class YaFSDPParamGroup:
         if len(reduce_dtypes) != 1:
             raise AssertionError(f"YaFSDP expects uniform reduce dtype but got {reduce_dtypes}")
         self._reduce_dtype = next(iter(reduce_dtypes))
+        all_gather_dtypes = {
+            fsdp_param.param_data._dtype if hasattr(fsdp_param.param_data, "fsdp_pre_all_gather") else None
+            for fsdp_param in self.fsdp_params
+        }
+        if len(all_gather_dtypes) != 1:
+            raise AssertionError(f"YaFSDP expects uniform unsharded data dtype but got {all_gather_dtypes}")
+        self._all_gather_dtype = next(iter(all_gather_dtypes))
 
     def lazy_init(self):
         # Lazy init should be idempotent
@@ -258,9 +333,16 @@ class YaFSDPParamGroup:
         self._register_state_dict_hooks()
         self._init_unsharded_params()
         if (yccl_handle := self._data_buffer_ctx.yccl_handle) is not None:
-            self._padded_sharded_param_data_param_dtype = yccl_handle.add_all_gather_input_buffer(
-                self._padded_sharded_param_data_param_dtype.numel()
-            ).copy_(self._padded_sharded_param_data_param_dtype)
+            self._all_gather_input = (
+                yccl_handle.add_all_gather_input_buffer(self._all_gather_input.view(torch.bfloat16).numel())
+                .view(self._all_gather_input.dtype)
+                .copy_(self._all_gather_input)
+            )
+        for fsdp_param, all_gather_input in zip(
+            self.fsdp_params,
+            self._all_gather_input[: sum(self._sharded_param_numels)].split(self._sharded_param_numels),
+        ):
+            fsdp_param.init_all_gather_input(all_gather_input)
         if (grad_buffer_ctx := self._grad_buffer_ctx) is not None and (
             yccl_handle := grad_buffer_ctx.yccl_handle
         ) is not None:
@@ -275,42 +357,45 @@ class YaFSDPParamGroup:
             return  # no-op
         if not self.unshard_in_backward and self._training_state == TrainingState.PRE_BACKWARD:
             return
-        # if self._reshard_after_forward_event is not None:
-        #     # Resharded parameter data is allocated in the default stream and
-        #     # used in the all-gather streams
-        #     self._wait_all_gather_stream_on_event(self._reshard_after_forward_event)
-        #     self._reshard_after_forward_event = None
         logger.debug("%s", self._with_fqn(f"YaFSDP::{self._training_state.name.lower()}_unshard"))
         with record_function(self._with_fqn("YaFSDP::all_gather")):
             self._all_gather_event = all_gather(
                 self,
                 self._padded_sharded_param_data,
-                self._padded_sharded_param_data_param_dtype,
-                self._unsharded_param_data,
+                self._all_gather_input,
+                self._all_gather_output,
                 self._data_buffer_ctx,
                 self._all_gather_process_group,
                 self.comm_ctx.get_all_gather_stream(self._training_state),
                 self._param_dtype,
+                self._all_gather_dtype,
                 self.device_handle,
                 self._data_buffer_ctx.yccl_handle,
             )
 
-    def wait_for_unshard(self):
+    def wait_for_unshard(
+        self,
+        register_post_backward_hook: bool = False,
+        args: Optional[Tuple[Any, ...]] = None,
+        kwargs: Optional[Dict[str, Any]] = None,
+    ):
         if self._all_gather_event:
             self.device_handle.current_stream().wait_event(self._all_gather_event)
         self._all_gather_event = None
+        for fsdp_param in self.fsdp_params:
+            fsdp_param.init_unsharded_param()
+        if register_post_backward_hook:
+            args, kwargs, unsharded_params = self._register_post_backward_hook(args, kwargs)
+            for fsdp_param, unsharded_param in unsharded_params.items():
+                fsdp_param.register_unsharded_param_with_post_backward_hook(unsharded_param)
         self._to_unsharded()
+        if register_post_backward_hook:
+            return args, kwargs
 
     def reshard(self):
         if self._training_state == TrainingState.FORWARD:
             if not self._reshard_after_forward:
                 return
-            if self._use_post_forward_mesh:
-                raise NotImplementedError("YaFSDP does not support post-forward mesh resharding yet")
-                # self._to_sharded_post_forward()
-                # self._reshard_after_forward_event = torch.Event()
-                # self._reshard_after_forward_event.record()
-                # return
         logger.debug("%s", self._with_fqn(f"YaFSDP::{self._training_state.name.lower()}_reshard"))
         self._to_sharded()
         self._data_buffer_ctx.release_event = self.device_handle.current_stream().record_event()
@@ -323,10 +408,7 @@ class YaFSDPParamGroup:
         with record_function(self._with_fqn("YaFSDP::pre_forward")):
             self._training_state = TrainingState.FORWARD
             self.unshard()
-            args, kwargs, unsharded_params = self._register_post_backward_hook(args, kwargs)
-            for fsdp_param, unsharded_param in unsharded_params.items():
-                fsdp_param._unsharded_params_for_backward.append(unsharded_param)
-            self.wait_for_unshard()
+            args, kwargs = self.wait_for_unshard(register_post_backward_hook=True, args=args, kwargs=kwargs)
             return args, kwargs
 
     def post_forward(self, module: nn.Module, input: Any, output: Any):
@@ -393,8 +475,8 @@ class YaFSDPParamGroup:
                     self,
                     fsdp_params_with_grad,
                     cast(torch.Tensor, self._padded_sharded_param_grad),
-                    cast(torch.Tensor, self._unsharded_param_grad),
-                    self._unsharded_param_grad_reduce_dtype,
+                    cast(torch.Tensor, self._padded_unsharded_param_grad),
+                    self._padded_unsharded_param_grad_reduce_dtype,
                     self._reduce_dtype_grad_buffer_ctx,
                     self._reduce_scatter_process_group,
                     self.comm_ctx.reduce_scatter_stream,
@@ -429,8 +511,9 @@ class YaFSDPParamGroup:
             self._data_buffer_ctx.owner = None
         self._post_forward_indices.clear()
         for fsdp_param in self.fsdp_params:
+            self._is_all_gather_input_set = False
             if fsdp_param.sharded_param.requires_grad:
-                assert len(fsdp_param._unsharded_params_for_backward) == 0
+                assert len(fsdp_param._unsharded_params_with_post_backward_hook) == 0
 
     def _wait_for_post_backward(self):
         if self._post_reduce_event is not None:
@@ -475,14 +558,8 @@ class YaFSDPParamGroup:
     def _to_sharded(self):
         if not self.is_sharded:
             for fsdp_param in self.fsdp_params:
-                fsdp_param.to_sharded()
+                fsdp_param.to_sharded(self._training_state)
             self._sharded_state = ShardedState.SHARDED
-
-    # def _to_sharded_post_forward(self):
-    #     if not self.is_sharded_post_forward:
-    #         for fsdp_param in self.fsdp_params:
-    #             fsdp_param.to_sharded_post_forward()
-    #         self._sharded_state = ShardedState.SHARDED_POST_FORWARD
 
     def _to_unsharded(self):
         for fsdp_param in self.fsdp_params:
@@ -493,10 +570,6 @@ class YaFSDPParamGroup:
     @property
     def is_sharded(self) -> bool:
         return self._sharded_state == ShardedState.SHARDED
-
-    @property
-    def is_sharded_post_forward(self) -> bool:
-        return self._sharded_state == ShardedState.SHARDED_POST_FORWARD
 
     @property
     def is_unsharded(self) -> bool:
@@ -665,13 +738,8 @@ class YaFSDPParamGroup:
         return self.post_forward_mesh_info is not None
 
     @property
-    def _use_post_forward_mesh(self) -> bool:
-        return self._reshard_after_forward and self.mesh_info != self.post_forward_mesh_info
-
-    @property
     def _all_gather_process_group(self) -> dist.ProcessGroup:
-        assert not self.is_sharded_post_forward
-        mesh_info = cast(FSDPMeshInfo, self.post_forward_mesh_info) if self.is_sharded_post_forward else self.mesh_info
+        mesh_info = self.mesh_info
         assert isinstance(mesh_info, FSDPMeshInfo)
         return mesh_info.shard_process_group
 
@@ -734,25 +802,306 @@ class RegisterPostBackwardFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grads: torch.Tensor):
-        fsdp_params_with_grads = [
-            fsdp_param for fsdp_param in ctx.param_group.fsdp_params if fsdp_param.sharded_param.requires_grad
-        ]
-        unsharded_param_grads, inp_grads = grads[: len(fsdp_params_with_grads)], grads[len(fsdp_params_with_grads) :]
-        # it's required that all (unsharded) params which require grad receive a gradient
-        for fsdp_param, unsharded_param_grad in zip(fsdp_params_with_grads, unsharded_param_grads, strict=True):
-            if unsharded_param_grad is None:
-                raise ValueError(
-                    f"{fsdp_param._param_fqn} requires grad, got unsharded during forward"
-                    ", but got no gradient after backward."
-                )
-            if fsdp_param._unsharded_param.grad is None:
-                fsdp_param._unsharded_param_grad.copy_(unsharded_param_grad)
-                fsdp_param._unsharded_param.grad = fsdp_param._unsharded_param_grad
-            else:
-                fsdp_param._unsharded_param.grad.add_(unsharded_param_grad)
+        param_group: YaFSDPParamGroup = ctx.param_group
+        for fsdp_param in param_group.fsdp_params:
+            if fsdp_param.sharded_param.requires_grad:
+                del fsdp_param._unsharded_params_with_post_backward_hook[-1]
         ctx.param_group.post_backward()
-        return (
-            None,
-            *(None for _ in unsharded_param_grads),
-            *inp_grads,
+        return (None,) + grads
+
+
+class MultiDtypeYaFSDPBufferContext(YaFSDPBufferContext):
+    def __init__(self, buffer_type: YaFSDPBufferContext.BufferType, mp_policy: MixedPrecisionPolicy):
+        self._all_gather_dtype_to_buffer_ctx: Dict[Optional[torch.dtype], YaFSDPBufferContext] = {
+            all_gather_dtype: YaFSDPBufferContext(buffer_type)
+            for all_gather_dtype in [mp_policy.param_dtype, *set(mp_policy.all_gather_dtype_to_param_cls)]
+        }
+
+    def lazy_init(
+        self,
+        buffer_size: Dict[torch.dtype, int],
+        dtype: torch.dtype,
+        device: torch.device,
+        yccl_handle: Optional["yccl.Handle"] = None,
+    ):
+        for all_gather_dtype, size in buffer_size.items():
+            (buffer_ctx := self._all_gather_dtype_to_buffer_ctx[all_gather_dtype]).lazy_init(
+                size,
+                all_gather_dtype if buffer_ctx._buffer_type == self.BufferType.ALL_GATHER else dtype,
+                device,
+                yccl_handle,
+            )
+
+    @property
+    def yccl_handle(self) -> torch.dtype:
+        return next(iter(buffer_ctx.yccl_handle for buffer_ctx in self._all_gather_dtype_to_buffer_ctx.values()))
+
+
+class MultiDtypeYaFSDPParamGroup(YaFSDPParamGroup):
+    def __init__(
+        self,
+        params: List[nn.Parameter],
+        modules: Tuple[nn.Module, ...],
+        mesh_info: FSDPMeshInfo,
+        post_forward_mesh_info: Optional[FSDPMeshInfo],
+        device: torch.device,
+        mp_policy: MixedPrecisionPolicy,
+        shard_alignment: int,
+    ):
+        all_gather_dtype_to_params = {
+            **{
+                mp_policy.param_dtype: [
+                    param
+                    for param in params
+                    if not any(
+                        isinstance(param, param_cls) for param_cls in mp_policy.all_gather_dtype_to_param_cls.values()
+                    )
+                ]
+            },
+            **{
+                all_gather_dtype: [param for param in params if isinstance(param, param_cls)]
+                for all_gather_dtype, param_cls in mp_policy.all_gather_dtype_to_param_cls.items()
+            },
+        }
+        self._all_gather_dtype_to_param_group = {
+            all_gather_dtype: YaFSDPParamGroup(
+                dtype_params,
+                tuple(
+                    module
+                    for module in modules
+                    if any(param is dtype_param for param in module.parameters() for dtype_param in dtype_params)
+                ),
+                mesh_info,
+                post_forward_mesh_info,
+                device,
+                mp_policy,
+                shard_alignment,
+            )
+            for all_gather_dtype, dtype_params in all_gather_dtype_to_params.items()
+            if dtype_params
+        }
+        self.__data_buffer_ctx = MultiDtypeYaFSDPBufferContext(
+            buffer_type=MultiDtypeYaFSDPBufferContext.BufferType.ALL_GATHER,
+            mp_policy=mp_policy,
         )
+        self.__grad_buffer_ctx = (
+            MultiDtypeYaFSDPBufferContext(
+                buffer_type=MultiDtypeYaFSDPBufferContext.BufferType.REDUCE_SCATTER,
+                mp_policy=mp_policy,
+            )
+            if any(
+                param_group._grad_buffer_ctx is not None
+                for param_group in self._all_gather_dtype_to_param_group.values()
+            )
+            else None
+        )
+        self.__reduce_dtype_grad_buffer_ctx = (
+            MultiDtypeYaFSDPBufferContext(
+                buffer_type=MultiDtypeYaFSDPBufferContext.BufferType.REDUCE_SCATTER,
+                mp_policy=mp_policy,
+            )
+            if any(
+                param_group._reduce_dtype_grad_buffer_ctx is not None
+                for param_group in self._all_gather_dtype_to_param_group.values()
+            )
+            else None
+        )
+
+    @property
+    def modules(self):
+        return list(
+            {module for param_group in self._all_gather_dtype_to_param_group.values() for module in param_group.modules}
+        )
+
+    @property
+    def fsdp_params(self):
+        return [
+            fsdp_param
+            for param_group in self._all_gather_dtype_to_param_group.values()
+            for fsdp_param in param_group.fsdp_params
+        ]
+
+    @property
+    def mesh_info(self) -> bool:
+        return next(iter(param_group.mesh_info for param_group in self._all_gather_dtype_to_param_group.values()))
+
+    @property
+    def _training_state(self) -> bool:
+        return next(iter(param_group._training_state for param_group in self._all_gather_dtype_to_param_group.values()))
+
+    @_training_state.setter
+    def _training_state(self, value):
+        for param_group in self._all_gather_dtype_to_param_group.values():
+            param_group._training_state = value
+
+    @property
+    def _module_fqn(self) -> bool:
+        return next(iter(param_group._module_fqn for param_group in self._all_gather_dtype_to_param_group.values()))
+
+    @_module_fqn.setter
+    def _module_fqn(self, value):
+        for param_group in self._all_gather_dtype_to_param_group.values():
+            param_group._module_fqn = value
+
+    @property
+    def comm_ctx(self):
+        return next(iter(param_group.comm_ctx for param_group in self._all_gather_dtype_to_param_group.values()))
+
+    @comm_ctx.setter
+    def comm_ctx(self, value):
+        for param_group in self._all_gather_dtype_to_param_group.values():
+            param_group.comm_ctx = value
+
+    @property
+    def reduce_grads(self):
+        return next(iter(param_group.reduce_grads for param_group in self._all_gather_dtype_to_param_group.values()))
+
+    @reduce_grads.setter
+    def reduce_grads(self, value):
+        for param_group in self._all_gather_dtype_to_param_group.values():
+            param_group.reduce_grads = value
+
+    @property
+    def reshard_after_backward(self):
+        return next(
+            iter(param_group.reshard_after_backward for param_group in self._all_gather_dtype_to_param_group.values())
+        )
+
+    @reshard_after_backward.setter
+    def reshard_after_backward(self, value):
+        for param_group in self._all_gather_dtype_to_param_group.values():
+            param_group.reshard_after_backward = value
+
+    @property
+    def unshard_in_backward(self) -> bool:
+        return next(
+            iter(param_group.unshard_in_backward for param_group in self._all_gather_dtype_to_param_group.values())
+        )
+
+    @property
+    def _data_buffer_ctx(self):
+        return self.__data_buffer_ctx
+
+    @_data_buffer_ctx.setter
+    def _data_buffer_ctx(self, value):
+        self.__data_buffer_ctx = value
+        for param_dtype, param_group in self._all_gather_dtype_to_param_group.items():
+            param_group._data_buffer_ctx = self._data_buffer_ctx._all_gather_dtype_to_buffer_ctx[param_dtype]
+
+    @property
+    def _grad_buffer_ctx(self):
+        return self.__grad_buffer_ctx
+
+    @_grad_buffer_ctx.setter
+    def _grad_buffer_ctx(self, value):
+        self.__grad_buffer_ctx = value
+        for param_dtype, param_group in self._all_gather_dtype_to_param_group.items():
+            param_group._grad_buffer_ctx = self._grad_buffer_ctx._all_gather_dtype_to_buffer_ctx[param_dtype]
+
+    @property
+    def _reduce_dtype_grad_buffer_ctx(self):
+        return self.__reduce_dtype_grad_buffer_ctx
+
+    @_reduce_dtype_grad_buffer_ctx.setter
+    def _reduce_dtype_grad_buffer_ctx(self, value):
+        self.__reduce_dtype_grad_buffer_ctx = value
+        for param_dtype, param_group in self._all_gather_dtype_to_param_group.items():
+            param_group._reduce_dtype_grad_buffer_ctx = (
+                self._reduce_dtype_grad_buffer_ctx._all_gather_dtype_to_buffer_ctx[param_dtype]
+            )
+
+    @property
+    def _state_dict_type(self):
+        return next(
+            iter(param_group._state_dict_type for param_group in self._all_gather_dtype_to_param_group.values())
+        )
+
+    @_state_dict_type.setter
+    def _state_dict_type(self, value):
+        for param_group in self._all_gather_dtype_to_param_group.values():
+            param_group._state_dict_type = value
+
+    @property
+    def _state_dict_config(self):
+        return next(
+            iter(param_group._state_dict_config for param_group in self._all_gather_dtype_to_param_group.values())
+        )
+
+    @_state_dict_config.setter
+    def _state_dict_config(self, value):
+        for param_group in self._all_gather_dtype_to_param_group.values():
+            param_group._state_dict_config = value
+
+    @property
+    def _padded_unsharded_param_size(self):
+        return {
+            all_gather_dtype: param_group._padded_unsharded_param_size
+            for all_gather_dtype, param_group in self._all_gather_dtype_to_param_group.items()
+        }
+
+    @property
+    def _orig_dtype(self) -> bool:
+        return next(iter(param_group._orig_dtype for param_group in self._all_gather_dtype_to_param_group.values()))
+
+    @property
+    def _param_dtype(self) -> bool:
+        return next(iter(param_group._param_dtype for param_group in self._all_gather_dtype_to_param_group.values()))
+
+    @property
+    def _reduce_dtype(self) -> bool:
+        return next(iter(param_group._reduce_dtype for param_group in self._all_gather_dtype_to_param_group.values()))
+
+    def lazy_init(self):
+        for param_group in self._all_gather_dtype_to_param_group.values():
+            param_group.lazy_init()
+
+    def unshard(self):
+        for param_group in self._all_gather_dtype_to_param_group.values():
+            param_group.unshard()
+
+    def wait_for_unshard(self):
+        for param_group in self._all_gather_dtype_to_param_group.values():
+            param_group.wait_for_unshard()
+
+    def reshard(self):
+        for param_group in self._all_gather_dtype_to_param_group.values():
+            param_group.reshard()
+
+    def pre_forward(
+        self, module: nn.Module, args: Tuple[Any, ...], kwargs: Dict[str, Any]
+    ) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
+        for param_group in self._all_gather_dtype_to_param_group.values():
+            args, kwargs = param_group.pre_forward(module, args, kwargs)
+        return args, kwargs
+
+    def post_forward(self, module: nn.Module, input: Any, output: Any):
+        for param_group in self._all_gather_dtype_to_param_group.values():
+            output = param_group.post_forward(module, input, output)
+        return output
+
+    def post_backward(self, *unused: Any):
+        for param_group in self._all_gather_dtype_to_param_group.values():
+            param_group.post_backward(*unused)
+
+    def pre_backward(self, default_prefetch: bool, *unused: Any):
+        for param_group in self._all_gather_dtype_to_param_group.values():
+            param_group.pre_backward(default_prefetch, *unused)
+
+    def finalize_backward(self):
+        for param_group in self._all_gather_dtype_to_param_group.values():
+            param_group.finalize_backward()
+
+    @property
+    def is_unsharded(self) -> bool:
+        return next(iter(param_group.is_unsharded for param_group in self._all_gather_dtype_to_param_group.values()))
+
+    @property
+    def _reshard_after_forward(self):
+        return next(
+            iter(param_group._reshard_after_forward for param_group in self._all_gather_dtype_to_param_group.values())
+        )
+
+    @_reshard_after_forward.setter
+    def _reshard_after_forward(self, value):
+        for param_group in self._all_gather_dtype_to_param_group.values():
+            param_group._reshard_after_forward = value

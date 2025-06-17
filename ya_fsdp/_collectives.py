@@ -4,7 +4,6 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ReduceOp
 
-from ._common import TrainingState
 from ._param import YaFSDPParam
 
 if TYPE_CHECKING:
@@ -19,12 +18,13 @@ if TYPE_CHECKING:
 def all_gather(
     param_group: "YaFSDPParamGroup",
     padded_sharded_param_data: torch.Tensor,
-    padded_sharded_param_data_param_dtype: torch.Tensor,
-    unsharded_param_data: torch.Tensor,
+    all_gather_input: torch.Tensor,
+    all_gather_output: torch.Tensor,
     data_buffer_ctx: "YaFSDPBufferContext",
     all_gather_group: dist.ProcessGroup,
     all_gather_stream: torch.Stream,
     param_dtype: Optional[torch.dtype],
+    all_gather_dtype: Optional[torch.dtype],
     device_handle: Any,
     yccl_handle: Optional["yccl.Handle"],
 ) -> torch.Event:
@@ -35,20 +35,20 @@ def all_gather(
         data_buffer_ctx.release_event = None
     data_buffer_ctx.owner = param_group
     with device_handle.stream(all_gather_stream):
-        if param_dtype is not None:
-            input_tensor = padded_sharded_param_data_param_dtype
-            if param_group._training_state == TrainingState.FORWARD and not param_group.is_sharded_param_grad_set():
-                input_tensor.copy_(padded_sharded_param_data)
-        else:
-            input_tensor = padded_sharded_param_data
+        if not param_group._is_all_gather_input_set:
+            for fsdp_param in param_group.fsdp_params:
+                fsdp_param.set_all_gather_input()
+            if all_gather_dtype is None and param_dtype is not None:
+                all_gather_input.copy_(padded_sharded_param_data)
+            param_group._is_all_gather_input_set = True
         if yccl_handle is None:
             dist.all_gather_into_tensor(
-                output_tensor=unsharded_param_data,
-                input_tensor=input_tensor,
+                output_tensor=all_gather_output,
+                input_tensor=all_gather_input,
                 group=all_gather_group,
             )
         else:
-            yccl_handle.all_gather(input_tensor, unsharded_param_data)
+            yccl_handle.all_gather(all_gather_input.view(torch.bfloat16), all_gather_output.view(torch.bfloat16))
     all_gather_event = all_gather_stream.record_event()
     return all_gather_event
 

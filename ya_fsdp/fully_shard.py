@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 import contextlib
-from typing import Any, Dict, Generator, Iterable, List, NoReturn, Optional, Type, Union, cast
+from typing import Any, Dict, Generator, Iterable, List, NoReturn, Optional, Type, Union, cast, overload
 
 import torch
 import torch.distributed as dist
@@ -22,13 +24,37 @@ from ._init import (
     _get_managed_states,
     _get_post_forward_mesh_info,
     _init_default_fully_shard_mesh,
-    _move_modules_to_device,
+    _move_states_to_device,
     _sync_states,
 )
-from ._param_group import YaFSDPParamGroup
+from ._param_group import MultiDtypeYaFSDPParamGroup, YaFSDPParamGroup, _get_param_module_infos
 from ._state import YaFSDPState, _get_module_fsdp_state
 
 cls_to_fsdp_cls: Dict[Type, Type] = {}
+
+
+@overload
+def fully_shard(
+    module: nn.Module,
+    *,
+    mesh: Optional[DeviceMesh] = ...,
+    reshard_after_forward: Union[bool, int] = ...,
+    mp_policy: MixedPrecisionPolicy = ...,
+    ignored_params: Optional[set[nn.Parameter]] = ...,
+) -> YaFSDPModule:
+    ...
+
+
+@overload
+def fully_shard(
+    module: list[nn.Module],
+    *,
+    mesh: Optional[DeviceMesh] = ...,
+    reshard_after_forward: Union[bool, int] = ...,
+    mp_policy: MixedPrecisionPolicy = ...,
+    ignored_params: Optional[set[nn.Parameter]] = ...,
+) -> list[YaFSDPModule]:
+    ...
 
 
 # The decorator adds a state object to `module` that can be accessed via
@@ -36,30 +62,23 @@ cls_to_fsdp_cls: Dict[Type, Type] = {}
 @contract(state_cls=YaFSDPState)
 def fully_shard(
     module: Union[nn.Module, List[nn.Module]],
-    mesh: DeviceMesh,
     *,
-    intra_node_pg: Optional[dist.ProcessGroup] = None,
-    orig_dtype: Optional[torch.dtype] = None,
+    mesh: Optional[DeviceMesh] = None,
     reshard_after_forward: bool = True,
     mp_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
+    ignored_params: Optional[set[nn.Parameter]] = None,
+    intra_node_pg: Optional[dist.ProcessGroup] = None,
+    orig_dtype: Optional[torch.dtype] = None,
     shard_alignment: int = 8,
 ):
     """
-    Apply YaFSDP to ``module``, where YaFSDP shards module parameters,
-    gradients, and optimizer states across data parallel workers to save memory
-    at the cost of communication.
-
     Args:
         module (Union[nn.Module, List[nn.Module]): The module or modules to
             shard with YaFSDP and group together for communication.
-        # mesh (Optional[DeviceMesh]): This data parallel mesh defines the
-        #     sharding and device. If 1D, then parameters are fully sharded
-        #     across the 1D mesh (FSDP) with ``(Shard(0),)`` placement. If 2D,
-        #     then parameters are sharded across the 1st dim and replicated
-        #     across the 0th dim (HSDP) with ``(Replicate(), Shard(0))``
-        #     placement. The mesh's device type gives the device type used for
-        #     communication; if a CUDA or CUDA-like device type, then we use the
-        #     current device.
+        mesh (Optional[DeviceMesh]): This data parallel mesh defines the
+            sharding and device. The mesh's device type gives the device type
+            used for communication; if a CUDA or CUDA-like device type, then we
+            use the current device.
         reshard_after_forward (bool): This controls the parameter
             behavior after forward and can trade off memory and communication:
 
@@ -70,8 +89,14 @@ def fully_shard(
         mp_policy (MixedPrecisionPolicy): This controls the mixed precision
             policy, which offers parameter/reduction mixed precision for this
             module. See :class:`MixedPrecisionPolicy` for details.
+        ignored_params: Optional(Set[nn.Parameter]): The set of parameters to be
+            ignored by YaFSDP. They will not be sharded, nor moved to the device
+            during init, nor have their gradients reduced in backward.
         shard_alignment (int): This controls alignment (in elements) of each
             shard tensor (which is padded to specified alignment)
+
+    Returns:
+        YaFSDPModule: The module with YaFSDP applied (in-place).
     """
     if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
         raise ValueError(f"fully_shard does not support containers that do not implement forward: {module}")
@@ -92,19 +117,34 @@ def fully_shard(
     state = fully_shard.state(modules[0])
     state.init(modules, device, mp_policy)
 
-    managed_modules = _get_managed_modules(modules)
-    _move_modules_to_device(managed_modules, device, param_dtype=orig_dtype)
-    params, buffers = _get_managed_states(managed_modules)
+    managed_modules = _get_managed_modules(modules, ignored_params)
+    params, buffers = _get_managed_states(managed_modules, ignored_params)
+
+    param_module_infos = _get_param_module_infos(params, modules)
+    _move_states_to_device(params, buffers, param_module_infos, device, param_dtype=orig_dtype)
+    params, buffers = _get_managed_states(managed_modules, ignored_params)
     _sync_states(params, buffers, process_group=mesh_info.intra_node_group)
     if params:
-        state._fsdp_param_group = YaFSDPParamGroup(
-            params,
-            modules,
-            mesh_info,
-            post_forward_mesh_info,
-            device,
-            mp_policy,
-            shard_alignment
+        state._fsdp_param_group = (
+            YaFSDPParamGroup(
+                params,
+                modules,
+                mesh_info,
+                post_forward_mesh_info,
+                device,
+                mp_policy,
+                shard_alignment,
+            )
+            if mp_policy.all_gather_dtype_to_param_cls is None
+            else MultiDtypeYaFSDPParamGroup(
+                params,
+                modules,
+                mesh_info,
+                post_forward_mesh_info,
+                device,
+                mp_policy,
+                shard_alignment,
+            )
         )
         del params
         torch.cuda.empty_cache()
@@ -192,6 +232,31 @@ class YaFSDPModule:
                     param_group.reduce_grads = requires_gradient_sync
                     state._validate_shared_state()
 
+    def set_reshard_after_forward(self, reshard_after_forward: bool, recurse: bool = True) -> None:
+        """
+        Sets if the module should reshard parameters after forward. This can be
+        used to change the ``reshard_after_forward`` FSDP arg at runtime. For
+        example, this can be used to set the FSDP root module's value to
+        ``True`` (since it is otherwise specially set to ``False``), or it can
+        set an FSDP module's value to ``False`` for running evals and set back
+        to ``True`` for training.
+
+        Args:
+            reshard_after_forward (bool): Whether to reshard parameters after
+                forward.
+            recurse (bool): Whether to set for all FSDP submodules or just the
+                passed-in module.
+        """
+        self_module = cast(nn.Module, self)
+        modules = list(self_module.modules()) if recurse else [self_module]
+        for module in modules:
+            if isinstance(module, YaFSDPModule):
+                state = module._get_fsdp_state()
+                if fsdp_param_group := state._fsdp_param_group:
+                    fsdp_param_group.post_forward_mesh_info = _get_post_forward_mesh_info(
+                        reshard_after_forward, fsdp_param_group.mesh_info
+                    )
+
     def set_reshard_after_backward(self, reshard_after_backward: bool, *, recurse: bool = True) -> None:
         """
         Sets if the module should reshard parameters after backward. This can
@@ -235,7 +300,7 @@ class YaFSDPModule:
         """
         Sets the FSDP modules for which this FSDP module should explicitly
         prefetch all-gathers in backward. This overrides the default backward
-        pretching implementation that prefetches the next FSDP module based on
+        prefetching implementation that prefetches the next FSDP module based on
         the reverse post-forward order.
 
         Passing a singleton list containing the previous FSDP module gives the
@@ -267,6 +332,17 @@ class YaFSDPModule:
                 to wait all-gather streams on.
         """
         self._get_fsdp_state()._state_ctx.post_optim_event = event
+
+    def set_unshard_in_backward(self, unshard_in_backward: bool) -> None:
+        """
+        Sets whether the FSDP module's parameters need to be unsharded in
+        backward. This can be used in expert cases when the user knows that all
+        parameters in this FSDP module's parameter group are not needed for
+        backward computation (e.g. embedding).
+        """
+        state = self._get_fsdp_state()
+        if (fsdp_param_group := state._fsdp_param_group) is not None:
+            fsdp_param_group.unshard_in_backward = unshard_in_backward
 
     def _get_fsdp_state(self) -> YaFSDPState:
         if (state := _get_module_fsdp_state(cast(nn.Module, self))) is None:
