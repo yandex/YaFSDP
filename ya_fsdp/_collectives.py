@@ -66,8 +66,10 @@ def reduce_scatter(
     param_dtype: Optional[torch.dtype],
     reduce_dtype: Optional[torch.dtype],
     device_handle: Any,
+    gradient_divide_factor: Optional[float],
     bit32_acc_for_bit16_reduce_scatter: bool,
     yccl_handle: Optional["yccl.Handle"],
+    force_sum_reduction_for_comms: bool = False,
 ) -> Tuple[torch.Event, torch.Event]:
     reduce_scatter_stream.wait_stream(device_handle.current_stream())
     with device_handle.stream(reduce_scatter_stream):
@@ -95,9 +97,11 @@ def reduce_scatter(
             output_tensor = padded_sharded_param_grad
         else:
             output_tensor = input_tensor.chunk(reduce_scatter_group.size())[reduce_scatter_group.rank()]
-        predivide_factor, postdivide_factor = _get_gradient_divide_factors(
+        predivide_factor, postdivide_factor, reduce_scatter_op = _get_gradient_divide_factors(
             reduce_scatter_group,
             reduce_dtype=reduce_dtype or param_dtype or orig_dtype,
+            factor=gradient_divide_factor,
+            force_sum_reduction_for_comms=force_sum_reduction_for_comms,
             yccl_handle=yccl_handle,
         )
         _div_if_needed(input_tensor, predivide_factor)
@@ -105,7 +109,7 @@ def reduce_scatter(
             dist.reduce_scatter_tensor(
                 output_tensor,
                 input_tensor,
-                op=ReduceOp.AVG if predivide_factor is None else ReduceOp.SUM,
+                op=reduce_scatter_op,
                 group=reduce_scatter_group,
                 **{"acc_type": torch.float32} if bit32_acc_for_bit16_reduce_scatter else {},
             )
@@ -132,24 +136,49 @@ def reduce_scatter(
 def _get_gradient_divide_factors(
     reduce_scatter_group: dist.ProcessGroup,
     reduce_dtype: torch.dtype,
-    yccl_handle: Optional["yccl.Handle"],
-) -> Union[Tuple[None, None], Tuple[None, float], Tuple[float, float]]:
+    factor: Optional[float] = None,
+    force_sum_reduction_for_comms: bool = False,
+    yccl_handle: Optional["yccl.Handle"] = None,
+) -> tuple[Optional[float], Optional[float], Union[dist.ReduceOp, dist.ReduceOp.RedOpType],]:
+    # YCCL only supports SUM reduction, hence we force it implicitly
+    if yccl_handle is not None:
+        force_sum_reduction_for_comms = True
+
     # For fp32/bf16, we do not need to worry about overflow/underflow, so we
     # use NCCL's built-in division to avoid separate div kernels
+    overflow_risk = reduce_dtype not in (torch.float32, torch.bfloat16)
+
     data_parallel_size = reduce_scatter_group.size()
-    if reduce_dtype in (torch.float32, torch.bfloat16):
-        if yccl_handle is None:
-            return None, None
+
+    if factor is None:
+        factor = float(data_parallel_size)
+
+    if not overflow_risk and not force_sum_reduction_for_comms:
+        if factor == data_parallel_size:
+            # Warning: NCCL ReduceOp.AVG may produce incorrect results with
+            # world size 1.
+            if data_parallel_size == 1:
+                return None, None, ReduceOp.SUM
+            return None, None, ReduceOp.AVG
         else:
-            return None, data_parallel_size
-    # Since fp16 has smaller dynamic range than fp32/bf16, we want to avoid
-    # overflow/underflow. For N data parallel workers, each worker computes
-    # g_i, and they collectively reduce (g_1 + ... + g_N) / N. To avoid
-    # overflow/underflow, we divide by ~sqrt(N) before/after the reduction.
-    factor: int = 1
-    while data_parallel_size % factor == 0 and data_parallel_size / factor > factor:
-        factor *= 2
-    return (float(factor), data_parallel_size / factor)
+            reduce_scatter_op = torch.distributed._make_nccl_premul_sum(1 / factor)
+            return None, None, reduce_scatter_op
+
+    pre_factor: Optional[float]
+    if overflow_risk:
+        # Since fp16 has smaller dynamic range than fp32/bf16, we want to avoid
+        # overflow/underflow. For N data parallel workers, each worker computes
+        # g_i, and they collectively reduce (g_1 + ... + g_N) / N. To avoid
+        # overflow/underflow, we divide by ~sqrt(N) before/after the reduction.
+        pre_factor = 1
+        while factor % pre_factor == 0 and factor / pre_factor > pre_factor:
+            pre_factor *= 2
+        post_factor = factor / pre_factor
+    else:
+        # Prefer post-multiplying as it operates on less data and is thus faster
+        pre_factor, post_factor = None, factor
+
+    return pre_factor, post_factor, ReduceOp.SUM
 
 
 def _div_if_needed(tensor: torch.Tensor, div_factor: Optional[float]) -> None:

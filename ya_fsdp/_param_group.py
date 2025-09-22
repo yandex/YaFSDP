@@ -150,6 +150,12 @@ class YaFSDPParamGroup:
         # Whether to reshard parameters after backward (only useful for
         # gradient accumulation)
         self.reshard_after_backward: bool = True
+        # Optional custom factor for the gradient reduction op (e.g. to divide
+        # by a factor other than the world size)
+        self.gradient_divide_factor: Optional[float] = None
+        # Whether reduce-scatter and all-reduce should be issued using only
+        # summations, potentially with separate pre-/post-scaling.
+        self.force_sum_reduction_for_comms: bool = False
         # Whether to unshard in backward: can be overridden by the user if the
         # parameters in this group are not needed for backward (e.g. embedding)
         self.unshard_in_backward: bool = True
@@ -484,8 +490,10 @@ class YaFSDPParamGroup:
                     self._param_dtype,
                     self._reduce_dtype,
                     self.device_handle,
+                    self.gradient_divide_factor,
                     self.mp_policy.bit32_acc_for_bit16_reduce_scatter,
                     self._grad_buffer_ctx.yccl_handle,
+                    self.force_sum_reduction_for_comms,
                 )
         else:
             grad_buffer_release_event = self.device_handle.current_stream().record_event()
@@ -971,6 +979,17 @@ class MultiDtypeYaFSDPParamGroup(YaFSDPParamGroup):
     def reshard_after_backward(self, value):
         for param_group in self._all_gather_dtype_to_param_group.values():
             param_group.reshard_after_backward = value
+
+    @property
+    def gradient_divide_factor(self):
+        return next(
+            iter(param_group.gradient_divide_factor for param_group in self._all_gather_dtype_to_param_group.values())
+        )
+
+    @gradient_divide_factor.setter
+    def gradient_divide_factor(self, value):
+        for param_group in self._all_gather_dtype_to_param_group.values():
+            param_group.gradient_divide_factor = value
 
     @property
     def unshard_in_backward(self) -> bool:
