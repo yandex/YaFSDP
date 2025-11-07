@@ -53,6 +53,19 @@ def all_gather(
     return all_gather_event
 
 
+def sizes_to_slices(sizes: list[int]) -> list[slice]:
+    """
+    >>> sizes_to_slices([20, 20, 30])
+    [slice(0, 20, None), slice(20, 40, None), slice(40, 70, None)]
+    """
+    offs = 0
+    slices = []
+    for sz in sizes:
+        slices.append(slice(offs, offs + sz))
+        offs += sz
+    return slices
+
+
 def reduce_scatter(
     param_group: "YaFSDPParamGroup",
     fsdp_params_with_grad: List[YaFSDPParam],
@@ -117,10 +130,19 @@ def reduce_scatter(
             yccl_handle.reduce_scatter(input_tensor)
         _div_if_needed(output_tensor, postdivide_factor)
         if not reduce_in_sharded:
-            if param_group.is_sharded_param_grad_set():
-                padded_sharded_param_grad.add_(output_tensor)
-            else:
-                padded_sharded_param_grad.copy_(output_tensor)
+            param_to_slice = dict(zip(param_group.fsdp_params, sizes_to_slices(param_group._sharded_param_numels)))
+            params_without_sharded_grad = list(filter(lambda p: p.sharded_param.grad is None, fsdp_params_with_grad))
+            if params_without_sharded_grad:
+                torch._foreach_copy_(
+                    [padded_sharded_param_grad[param_to_slice[p]] for p in params_without_sharded_grad],
+                    [output_tensor[param_to_slice[p]] for p in params_without_sharded_grad],
+                )
+            params_with_sharded_grad = list(filter(lambda p: p.sharded_param.grad is not None, fsdp_params_with_grad))
+            if params_with_sharded_grad:
+                torch._foreach_add_(
+                    [padded_sharded_param_grad[param_to_slice[p]] for p in params_with_sharded_grad],
+                    [output_tensor[param_to_slice[p]] for p in params_with_sharded_grad],
+                )
         post_reduce_event = reduce_scatter_stream.record_event()
         if reduce_dtype is not None:
             reduce_dtype_grad_buffer_ctx = cast("YaFSDPBufferContext", reduce_dtype_grad_buffer_ctx)
