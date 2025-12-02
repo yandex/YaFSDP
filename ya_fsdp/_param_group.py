@@ -803,7 +803,6 @@ def _get_param_module_infos(params: List[nn.Parameter], modules: Tuple[nn.Module
 class RegisterPostBackwardFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, param_group: YaFSDPParamGroup, *inputs: torch.Tensor):
-        # All tensors in `inputs` should require gradient
         ctx.param_group = param_group
         ctx.set_materialize_grads(False)
         return inputs
