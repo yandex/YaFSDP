@@ -1,7 +1,7 @@
 import traceback
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -12,12 +12,14 @@ from torch.distributed.tensor import DeviceMesh
 class DataParallelMeshInfo:
     mesh: DeviceMesh
     intra_node_group: dist.ProcessGroup
-    shard_mesh_dim: Optional[int] = None
-    replicate_mesh_dim: Optional[int] = None
+    shard_mesh_dim: int | None = None
+    replicate_mesh_dim: int | None = None
 
     def __post_init__(self) -> None:
         if self.shard_mesh_dim is None and self.replicate_mesh_dim is None:
-            raise AssertionError("At least one of shard_mesh_dim and replicate_mesh_dim must not be None")
+            raise AssertionError(
+                "At least one of shard_mesh_dim and replicate_mesh_dim must not be None"
+            )
 
 
 @dataclass
@@ -32,8 +34,6 @@ class FSDPMeshInfo(DataParallelMeshInfo):
 
 
 class TrainingState(Enum):
-    """Describes the training state of one FSDP state / parameter group."""
-
     # Transition to forward starting pre-forward until post-forward
     FORWARD = auto()
     # Transition to pre-backward when unsharding in backward
@@ -52,6 +52,10 @@ def _raise_assert_with_print(*args: Any, **kwargs: Any):
 
 
 def _cast_fp_tensor(dtype: torch.dtype, x: torch.Tensor) -> torch.Tensor:
-    if not isinstance(x, torch.Tensor) or not torch.is_floating_point(x) or x.dtype == dtype:
+    if (
+        not isinstance(x, torch.Tensor)
+        or not torch.is_floating_point(x)
+        or x.dtype == dtype
+    ):
         return x
     return x.to(dtype)

@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union, cast
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 import torch
 import torch.distributed as dist
@@ -23,8 +23,8 @@ def all_gather(
     data_buffer_ctx: "YaFSDPBufferContext",
     all_gather_group: dist.ProcessGroup,
     all_gather_stream: torch.Stream,
-    param_dtype: Optional[torch.dtype],
-    all_gather_dtype: Optional[torch.dtype],
+    param_dtype: torch.dtype | None,
+    all_gather_dtype: torch.dtype | None,
     device_handle: Any,
     yccl_handle: Optional["yccl.Handle"],
 ) -> torch.Event:
@@ -48,13 +48,17 @@ def all_gather(
                 group=all_gather_group,
             )
         else:
-            yccl_handle.all_gather(all_gather_input.view(torch.bfloat16), all_gather_output.view(torch.bfloat16))
+            yccl_handle.all_gather(
+                all_gather_input.view(torch.bfloat16),
+                all_gather_output.view(torch.bfloat16),
+            )
     all_gather_event = all_gather_stream.record_event()
     return all_gather_event
 
 
 def sizes_to_slices(sizes: list[int]) -> list[slice]:
-    """
+    """Map a list of sizes to a list of slices.
+
     >>> sizes_to_slices([20, 20, 30])
     [slice(0, 20, None), slice(20, 40, None), slice(40, 70, None)]
     """
@@ -66,33 +70,41 @@ def sizes_to_slices(sizes: list[int]) -> list[slice]:
     return slices
 
 
-def reduce_scatter(
+def reduce_scatter(  # noqa: PLR0912
     param_group: "YaFSDPParamGroup",
-    fsdp_params_with_grad: List[YaFSDPParam],
+    fsdp_params_with_grad: list[YaFSDPParam],
     padded_sharded_param_grad: torch.Tensor,
     unsharded_param_grad: torch.Tensor,
-    unsharded_param_grad_reduce_dtype: Optional[torch.Tensor],
+    unsharded_param_grad_reduce_dtype: torch.Tensor | None,
     reduce_dtype_grad_buffer_ctx: Optional["YaFSDPBufferContext"],
     reduce_scatter_group: dist.ProcessGroup,
     reduce_scatter_stream: torch.Stream,
     orig_dtype: torch.dtype,
-    param_dtype: Optional[torch.dtype],
-    reduce_dtype: Optional[torch.dtype],
+    param_dtype: torch.dtype | None,
+    reduce_dtype: torch.dtype | None,
     device_handle: Any,
-    gradient_divide_factor: Optional[float],
+    gradient_divide_factor: float | None,
     bit32_acc_for_bit16_reduce_scatter: bool,
     yccl_handle: Optional["yccl.Handle"],
     force_sum_reduction_for_comms: bool = False,
-) -> Tuple[torch.Event, torch.Event]:
+) -> tuple[torch.Event, torch.Event]:
     reduce_scatter_stream.wait_stream(device_handle.current_stream())
     with device_handle.stream(reduce_scatter_stream):
         if reduce_dtype is not None:
-            reduce_dtype_grad_buffer_ctx = cast("YaFSDPBufferContext", reduce_dtype_grad_buffer_ctx)
-            unsharded_param_grad_reduce_dtype = cast(torch.Tensor, unsharded_param_grad_reduce_dtype)
+            reduce_dtype_grad_buffer_ctx = cast(
+                "YaFSDPBufferContext", reduce_dtype_grad_buffer_ctx
+            )
+            unsharded_param_grad_reduce_dtype = cast(
+                "torch.Tensor", unsharded_param_grad_reduce_dtype
+            )
             if (owner := reduce_dtype_grad_buffer_ctx.owner) is not None:
-                raise RuntimeError(f"Reduce dtype gradient buffer already in use by {owner}")
+                raise RuntimeError(
+                    f"Reduce dtype gradient buffer already in use by {owner}"
+                )
             else:
-                if (release_event := reduce_dtype_grad_buffer_ctx.release_event) is not None:
+                if (
+                    release_event := reduce_dtype_grad_buffer_ctx.release_event
+                ) is not None:
                     reduce_scatter_stream.wait_event(release_event)
                     reduce_dtype_grad_buffer_ctx.release_event = None
                 reduce_dtype_grad_buffer_ctx.owner = param_group
@@ -102,20 +114,27 @@ def reduce_scatter(
         else:
             input_tensor = unsharded_param_grad
         reduce_in_sharded = (
-            (reduce_dtype is None and param_dtype is None or reduce_dtype == orig_dtype)
+            (
+                (reduce_dtype is None and param_dtype is None)
+                or reduce_dtype == orig_dtype
+            )
             and not param_group.is_sharded_param_grad_set()
             and yccl_handle is None
         )
         if reduce_in_sharded:
             output_tensor = padded_sharded_param_grad
         else:
-            output_tensor = input_tensor.chunk(reduce_scatter_group.size())[reduce_scatter_group.rank()]
-        predivide_factor, postdivide_factor, reduce_scatter_op = _get_gradient_divide_factors(
-            reduce_scatter_group,
-            reduce_dtype=reduce_dtype or param_dtype or orig_dtype,
-            factor=gradient_divide_factor,
-            force_sum_reduction_for_comms=force_sum_reduction_for_comms,
-            yccl_handle=yccl_handle,
+            output_tensor = input_tensor.chunk(reduce_scatter_group.size())[
+                reduce_scatter_group.rank()
+            ]
+        predivide_factor, postdivide_factor, reduce_scatter_op = (
+            _get_gradient_divide_factors(
+                reduce_scatter_group,
+                reduce_dtype=reduce_dtype or param_dtype or orig_dtype,
+                factor=gradient_divide_factor,
+                force_sum_reduction_for_comms=force_sum_reduction_for_comms,
+                yccl_handle=yccl_handle,
+            )
         )
         _div_if_needed(input_tensor, predivide_factor)
         if yccl_handle is None:
@@ -124,28 +143,58 @@ def reduce_scatter(
                 input_tensor,
                 op=reduce_scatter_op,
                 group=reduce_scatter_group,
-                **{"acc_type": torch.float32} if bit32_acc_for_bit16_reduce_scatter else {},
+                **(
+                    {"acc_type": torch.float32}
+                    if bit32_acc_for_bit16_reduce_scatter
+                    else {}
+                ),
             )
         else:
             yccl_handle.reduce_scatter(input_tensor)
         _div_if_needed(output_tensor, postdivide_factor)
         if not reduce_in_sharded:
-            param_to_slice = dict(zip(param_group.fsdp_params, sizes_to_slices(param_group._sharded_param_numels)))
-            params_without_sharded_grad = list(filter(lambda p: p.sharded_param.grad is None, fsdp_params_with_grad))
+            param_to_slice = dict(
+                zip(
+                    param_group.fsdp_params,
+                    sizes_to_slices(param_group._sharded_param_numels),
+                    strict=True,
+                )
+            )
+            params_without_sharded_grad = list(
+                filter(lambda p: p.sharded_param.grad is None, fsdp_params_with_grad)
+            )
             if params_without_sharded_grad:
                 torch._foreach_copy_(
-                    [padded_sharded_param_grad[param_to_slice[p]] for p in params_without_sharded_grad],
-                    [output_tensor[param_to_slice[p]] for p in params_without_sharded_grad],
+                    [
+                        padded_sharded_param_grad[param_to_slice[p]]
+                        for p in params_without_sharded_grad
+                    ],
+                    [
+                        output_tensor[param_to_slice[p]]
+                        for p in params_without_sharded_grad
+                    ],
                 )
-            params_with_sharded_grad = list(filter(lambda p: p.sharded_param.grad is not None, fsdp_params_with_grad))
+            params_with_sharded_grad = list(
+                filter(
+                    lambda p: p.sharded_param.grad is not None, fsdp_params_with_grad
+                )
+            )
             if params_with_sharded_grad:
                 torch._foreach_add_(
-                    [padded_sharded_param_grad[param_to_slice[p]] for p in params_with_sharded_grad],
-                    [output_tensor[param_to_slice[p]] for p in params_with_sharded_grad],
+                    [
+                        padded_sharded_param_grad[param_to_slice[p]]
+                        for p in params_with_sharded_grad
+                    ],
+                    [
+                        output_tensor[param_to_slice[p]]
+                        for p in params_with_sharded_grad
+                    ],
                 )
         post_reduce_event = reduce_scatter_stream.record_event()
         if reduce_dtype is not None:
-            reduce_dtype_grad_buffer_ctx = cast("YaFSDPBufferContext", reduce_dtype_grad_buffer_ctx)
+            reduce_dtype_grad_buffer_ctx = cast(
+                "YaFSDPBufferContext", reduce_dtype_grad_buffer_ctx
+            )
             reduce_dtype_grad_buffer_ctx.release_event = post_reduce_event
             reduce_dtype_grad_buffer_ctx.owner = None
         else:
@@ -158,10 +207,14 @@ def reduce_scatter(
 def _get_gradient_divide_factors(
     reduce_scatter_group: dist.ProcessGroup,
     reduce_dtype: torch.dtype,
-    factor: Optional[float] = None,
+    factor: float | None = None,
     force_sum_reduction_for_comms: bool = False,
     yccl_handle: Optional["yccl.Handle"] = None,
-) -> tuple[Optional[float], Optional[float], Union[dist.ReduceOp, dist.ReduceOp.RedOpType],]:
+) -> tuple[
+    float | None,
+    float | None,
+    dist.ReduceOp | dist.ReduceOp.RedOpType,
+]:
     # YCCL only supports SUM reduction, hence we force it implicitly
     if yccl_handle is not None:
         force_sum_reduction_for_comms = True
@@ -186,7 +239,7 @@ def _get_gradient_divide_factors(
             reduce_scatter_op = torch.distributed._make_nccl_premul_sum(1 / factor)
             return None, None, reduce_scatter_op
 
-    pre_factor: Optional[float]
+    pre_factor: float | None
     if overflow_risk:
         # Since fp16 has smaller dynamic range than fp32/bf16, we want to avoid
         # overflow/underflow. For N data parallel workers, each worker computes
@@ -203,6 +256,6 @@ def _get_gradient_divide_factors(
     return pre_factor, post_factor, ReduceOp.SUM
 
 
-def _div_if_needed(tensor: torch.Tensor, div_factor: Optional[float]) -> None:
+def _div_if_needed(tensor: torch.Tensor, div_factor: float | None) -> None:
     if div_factor is not None and div_factor > 1:
         tensor.div_(div_factor)

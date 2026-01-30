@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import contextlib
-from typing import Any, Dict, Generator, Iterable, List, NoReturn, Optional, Type, Union, cast, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    NoReturn,
+    cast,
+    overload,
+)
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed._composable import contract
-from torch.distributed._tensor import DeviceMesh
 
 from ._api import (
     FullStateDictConfig,
@@ -27,79 +32,61 @@ from ._init import (
     _move_states_to_device,
     _sync_states,
 )
-from ._param_group import MultiDtypeYaFSDPParamGroup, YaFSDPParamGroup, _get_param_module_infos
+from ._param_group import (
+    MultiDtypeYaFSDPParamGroup,
+    YaFSDPParamGroup,
+    _get_param_module_infos,
+)
 from ._state import YaFSDPState, _get_module_fsdp_state
 
-cls_to_fsdp_cls: Dict[Type, Type] = {}
+if TYPE_CHECKING:
+    from collections.abc import Generator, Iterable
+
+    from torch.distributed._tensor import DeviceMesh
+
+cls_to_fsdp_cls: dict[type, type] = {}
 
 
 @overload
 def fully_shard(
     module: nn.Module,
     *,
-    mesh: Optional[DeviceMesh] = ...,
-    reshard_after_forward: Union[bool, int] = ...,
+    mesh: DeviceMesh | None = ...,
+    reshard_after_forward: bool | int = ...,
     mp_policy: MixedPrecisionPolicy = ...,
-    ignored_params: Optional[set[nn.Parameter]] = ...,
-) -> YaFSDPModule:
-    ...
+    ignored_params: set[nn.Parameter] | None = ...,
+) -> YaFSDPModule: ...
 
 
 @overload
 def fully_shard(
     module: list[nn.Module],
     *,
-    mesh: Optional[DeviceMesh] = ...,
-    reshard_after_forward: Union[bool, int] = ...,
+    mesh: DeviceMesh | None = ...,
+    reshard_after_forward: bool | int = ...,
     mp_policy: MixedPrecisionPolicy = ...,
-    ignored_params: Optional[set[nn.Parameter]] = ...,
-) -> list[YaFSDPModule]:
-    ...
+    ignored_params: set[nn.Parameter] | None = ...,
+) -> list[YaFSDPModule]: ...
 
 
 # The decorator adds a state object to `module` that can be accessed via
 # `fully_shard.state(module)`. The state object and module are 1:1.
 @contract(state_cls=YaFSDPState)
 def fully_shard(
-    module: Union[nn.Module, List[nn.Module]],
+    module: nn.Module | list[nn.Module],
     *,
-    mesh: Optional[DeviceMesh] = None,
+    mesh: DeviceMesh | None = None,
     reshard_after_forward: bool = True,
-    mp_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
-    ignored_params: Optional[set[nn.Parameter]] = None,
-    intra_node_pg: Optional[dist.ProcessGroup] = None,
-    orig_dtype: Optional[torch.dtype] = None,
+    mp_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),  # noqa: B008
+    ignored_params: set[nn.Parameter] | None = None,
+    intra_node_pg: dist.ProcessGroup | None = None,
+    orig_dtype: torch.dtype | None = None,
     shard_alignment: int = 8,
 ):
-    """
-    Args:
-        module (Union[nn.Module, List[nn.Module]): The module or modules to
-            shard with YaFSDP and group together for communication.
-        mesh (Optional[DeviceMesh]): This data parallel mesh defines the
-            sharding and device. The mesh's device type gives the device type
-            used for communication; if a CUDA or CUDA-like device type, then we
-            use the current device.
-        reshard_after_forward (bool): This controls the parameter
-            behavior after forward and can trade off memory and communication:
-
-            - If ``True``, then this reshards parameters after forward and
-              re-all-gathers in backward.
-            - If ``False``, then this keeps the unsharded parameters in memory
-              after forward and avoids the all-gather in backward.
-        mp_policy (MixedPrecisionPolicy): This controls the mixed precision
-            policy, which offers parameter/reduction mixed precision for this
-            module. See :class:`MixedPrecisionPolicy` for details.
-        ignored_params: Optional(Set[nn.Parameter]): The set of parameters to be
-            ignored by YaFSDP. They will not be sharded, nor moved to the device
-            during init, nor have their gradients reduced in backward.
-        shard_alignment (int): This controls alignment (in elements) of each
-            shard tensor (which is padded to specified alignment)
-
-    Returns:
-        YaFSDPModule: The module with YaFSDP applied (in-place).
-    """
-    if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
-        raise ValueError(f"fully_shard does not support containers that do not implement forward: {module}")
+    if isinstance(module, nn.ModuleList | nn.ModuleDict):
+        raise ValueError(
+            f"fully_shard does not support containers that do not implement forward: {module}"
+        )
     mesh = mesh or _init_default_fully_shard_mesh()
     if mesh.ndim != 1:
         raise ValueError(f"fully_shard expects a 1D DeviceMesh but got {mesh}")
@@ -110,7 +97,9 @@ def fully_shard(
             intra_node_group=intra_node_pg or mesh.get_group(),
         )
     device = _get_device_from_mesh(mesh)
-    post_forward_mesh_info = _get_post_forward_mesh_info(reshard_after_forward, mesh_info)
+    post_forward_mesh_info = _get_post_forward_mesh_info(
+        reshard_after_forward, mesh_info
+    )
 
     arg_module = module
     modules = (module,) if isinstance(module, nn.Module) else tuple(module)
@@ -121,7 +110,9 @@ def fully_shard(
     params, buffers = _get_managed_states(managed_modules, ignored_params)
 
     param_module_infos = _get_param_module_infos(params, modules)
-    _move_states_to_device(params, buffers, param_module_infos, device, param_dtype=orig_dtype)
+    _move_states_to_device(
+        params, buffers, param_module_infos, device, param_dtype=orig_dtype
+    )
     params, buffers = _get_managed_states(managed_modules, ignored_params)
     _sync_states(params, buffers, process_group=mesh_info.intra_node_group)
     if params:
@@ -150,7 +141,7 @@ def fully_shard(
         torch.cuda.empty_cache()
 
     # Place YaFSDP leftmost for highest priority in the method resolution order
-    for module in modules:
+    for module in modules:  # noqa: PLR1704
         cls = module.__class__
         new_cls = cls_to_fsdp_cls.get(cls, None)
         if not new_cls:
@@ -163,15 +154,13 @@ def fully_shard(
 
 
 def unimplemented_deepcopy(*args: Any, **kwargs: Any) -> NoReturn:
-    raise AssertionError("YaFSDP does not support deepcopy. Please use state dict for serialization.")
+    raise AssertionError(
+        "YaFSDP does not support deepcopy. Please use state dict for serialization."
+    )
 
 
 class YaFSDPModule:
     def __new__(cls, *args, **kwargs):
-        """
-        Override ``__new__`` to remove the YaFSDP class and directly construct
-        the original class for cases like indexing into a container module.
-        """
         # Use index 2 since 0 is the dynamically constructed `YaFSDP<...>` class
         # and index 1 is the `YaFSDPModule` class itself
         orig_cls = cls.__mro__[2]
@@ -180,20 +169,11 @@ class YaFSDPModule:
         return self
 
     def reshard(self) -> None:
-        """
-        Reshards the module's parameters, registering the sharded parameters
-        to the module and freeing the unsharded parameters if needed. This
-        method is *not* recursive.
-        """
         state = self._get_fsdp_state()
         if fsdp_param_group := state._fsdp_param_group:
             fsdp_param_group.reshard()
 
     def unshard(self) -> None:
-        """
-        Unshards the module's parameters by allocating memory and all-gathering
-        the parameters. This method is *not* recursive.
-        """
         state = self._get_fsdp_state()
         fsdp_param_group = state._fsdp_param_group
         if fsdp_param_group is not None:
@@ -202,27 +182,13 @@ class YaFSDPModule:
             fsdp_param_group.wait_for_unshard()
 
     def set_is_last_backward(self, is_last_backward: bool) -> None:
-        """
-        Sets whether the next backward is the last one, meaning that FSDP
-        should wait for gradient reduction to finish and clear internal data
-        structures used for explicit prefetching.
-        """
         state = self._get_fsdp_state()
         state._state_ctx.is_last_backward = is_last_backward
 
-    def set_requires_gradient_sync(self, requires_gradient_sync: bool, *, recurse: bool = True) -> None:
-        """
-        Sets if the module should sync gradients. This can be used to implement
-        gradient accumulation without communication. For HSDP, this controls
-        both reduce-scatter and all-reduce together.
-
-        Args:
-            requires_gradient_sync (bool): Whether to reduce gradients for the
-                module's parameters.
-            recurse (bool): Whether to set for all submodules or just the
-                passed-in module.
-        """
-        self_module = cast(nn.Module, self)
+    def set_requires_gradient_sync(
+        self, requires_gradient_sync: bool, *, recurse: bool = True
+    ) -> None:
+        self_module = cast("nn.Module", self)
         modules = list(self_module.modules()) if recurse else [self_module]
         for module in modules:
             if isinstance(module, YaFSDPModule):
@@ -232,44 +198,25 @@ class YaFSDPModule:
                     param_group.reduce_grads = requires_gradient_sync
                     state._validate_shared_state()
 
-    def set_reshard_after_forward(self, reshard_after_forward: bool, recurse: bool = True) -> None:
-        """
-        Sets if the module should reshard parameters after forward. This can be
-        used to change the ``reshard_after_forward`` FSDP arg at runtime. For
-        example, this can be used to set the FSDP root module's value to
-        ``True`` (since it is otherwise specially set to ``False``), or it can
-        set an FSDP module's value to ``False`` for running evals and set back
-        to ``True`` for training.
-
-        Args:
-            reshard_after_forward (bool): Whether to reshard parameters after
-                forward.
-            recurse (bool): Whether to set for all FSDP submodules or just the
-                passed-in module.
-        """
-        self_module = cast(nn.Module, self)
+    def set_reshard_after_forward(
+        self, reshard_after_forward: bool, recurse: bool = True
+    ) -> None:
+        self_module = cast("nn.Module", self)
         modules = list(self_module.modules()) if recurse else [self_module]
         for module in modules:
             if isinstance(module, YaFSDPModule):
                 state = module._get_fsdp_state()
                 if fsdp_param_group := state._fsdp_param_group:
-                    fsdp_param_group.post_forward_mesh_info = _get_post_forward_mesh_info(
-                        reshard_after_forward, fsdp_param_group.mesh_info
+                    fsdp_param_group.post_forward_mesh_info = (
+                        _get_post_forward_mesh_info(
+                            reshard_after_forward, fsdp_param_group.mesh_info
+                        )
                     )
 
-    def set_reshard_after_backward(self, reshard_after_backward: bool, *, recurse: bool = True) -> None:
-        """
-        Sets if the module should reshard parameters after backward. This can
-        be used during gradient accumulation to trade off higher memory for
-        reduced communication.
-
-        Args:
-            reshard_after_backward (bool): Whether to reshard parameters after
-                backward.
-            recurse (bool): Whether to set for all submodules or just the
-                passed-in module.
-        """
-        self_module = cast(nn.Module, self)
+    def set_reshard_after_backward(
+        self, reshard_after_backward: bool, *, recurse: bool = True
+    ) -> None:
+        self_module = cast("nn.Module", self)
         modules = list(self_module.modules()) if recurse else [self_module]
         for module in modules:
             if isinstance(module, YaFSDPModule):
@@ -278,117 +225,47 @@ class YaFSDPModule:
                     fsdp_param_group.reshard_after_backward = reshard_after_backward
                     state._validate_shared_state()
 
-    def set_modules_to_forward_prefetch(self, modules: List["YaFSDPModule"]) -> None:
-        """
-        Sets the FSDP modules for which this FSDP module should explicitly
-        prefetch all-gathers in forward. The prefetching runs after this
-        module's all-gather copy-out.
-
-        Passing a singleton list containing the next FSDP module gives the same
-        all-gather overlap behavior as the default overlap behavior, except the
-        prefetched all-gather is issued earlier from the CPU. Passing a list
-        with at least length two is required for more aggressive overlap and
-        will use more reserved memory.
-
-        Args:
-            modules (List[FSDPModule]): FSDP modules to prefetch.
-        """
+    def set_modules_to_forward_prefetch(self, modules: list[YaFSDPModule]) -> None:
         _assert_all_fsdp_modules(modules)
-        self._get_fsdp_state()._states_to_forward_prefetch = [module._get_fsdp_state() for module in modules]
+        self._get_fsdp_state()._states_to_forward_prefetch = [
+            module._get_fsdp_state() for module in modules
+        ]
 
-    def set_modules_to_backward_prefetch(self, modules: List["YaFSDPModule"]) -> None:
-        """
-        Sets the FSDP modules for which this FSDP module should explicitly
-        prefetch all-gathers in backward. This overrides the default backward
-        prefetching implementation that prefetches the next FSDP module based on
-        the reverse post-forward order.
-
-        Passing a singleton list containing the previous FSDP module gives the
-        same all-gather overlap behavior as the default overlap behavior.
-        Passing a list with at least length two is required for more aggressive
-        overlap and will use more reserved memory.
-
-        Args:
-            modules (List[YaFSDPModule]): FSDP modules to prefetch.
-        """
+    def set_modules_to_backward_prefetch(self, modules: list[YaFSDPModule]) -> None:
         _assert_all_fsdp_modules(modules)
-        self._get_fsdp_state()._states_to_backward_prefetch = [module._get_fsdp_state() for module in modules]
+        self._get_fsdp_state()._states_to_backward_prefetch = [
+            module._get_fsdp_state() for module in modules
+        ]
 
     def set_post_optim_event(self, event: torch.Event) -> None:
-        """
-        Sets a post-optimizer-step event for the root FSDP module to wait the
-        all-gather streams on.
-
-        By default, the root FSDP module waits the all-gather streams on the
-        current stream to ensure that the optimizer step has finished before
-        all-gathering. However, this may introduce false dependencies if
-        there is unrelated computation after the optimizer step. This API
-        allows the user to provide their own event to wait on. After the root
-        waits on the event, the event is discarded, so this API should be
-        called with a new event each iteration.
-
-        Args:
-            event (torch.Event): Event recorded after the optimizer step
-                to wait all-gather streams on.
-        """
         self._get_fsdp_state()._state_ctx.post_optim_event = event
 
     def set_unshard_in_backward(self, unshard_in_backward: bool) -> None:
-        """
-        Sets whether the FSDP module's parameters need to be unsharded in
-        backward. This can be used in expert cases when the user knows that all
-        parameters in this FSDP module's parameter group are not needed for
-        backward computation (e.g. embedding).
-        """
         state = self._get_fsdp_state()
         if (fsdp_param_group := state._fsdp_param_group) is not None:
             fsdp_param_group.unshard_in_backward = unshard_in_backward
 
     def set_gradient_divide_factor(self, factor: float) -> None:
-        """
-        Sets a custom divide factor for the gradient reduction. This might use
-        a custom reduce op using NCCL's PreMulSum, which allows multiplying by
-        the factor before reduction.
-
-        Args:
-            factor (float): Custom divide factor.
-        """
         state = self._get_fsdp_state()
         if (fsdp_param_group := state._fsdp_param_group) is not None:
             fsdp_param_group.gradient_divide_factor = factor
 
     def set_force_sum_reduction_for_comms(self, enable: bool) -> None:
-        """
-        Sets whether to require the low-level collective communication
-        primitives to exclusively use "sum"-type reductions, even if it comes
-        at the cost of separate additional pre- or post-scaling operations.
-        This is needed for example because NCCL currently supports zero-copy
-        transfers only for this kind of collectives.
-
-        NB: for MTIA devices, this is always implicitly enabled.
-
-        NB: if `set_all_reduce_hook` is used under FSDP setup, the caller needs
-        to ensure the custom all-reduce across FSDP units follow this strategy
-        as well, as FSDP can no longer automatically handle that.
-
-        Args:
-            enable (bool): Whether to only ever use ReduceOp.SUM for comms.
-        """
         state = self._get_fsdp_state()
         if (fsdp_param_group := state._fsdp_param_group) is not None:
             fsdp_param_group.force_sum_reduction_for_comms = enable
 
     def _get_fsdp_state(self) -> YaFSDPState:
-        if (state := _get_module_fsdp_state(cast(nn.Module, self))) is None:
+        if (state := _get_module_fsdp_state(cast("nn.Module", self))) is None:
             raise AssertionError(f"No YaFSDP state found on {self}")
         return state
 
     def set_state_dict_type(
         self,
         state_dict_type: StateDictType,
-        state_dict_config: Optional[StateDictConfig] = None,
+        state_dict_config: StateDictConfig | None = None,
     ) -> StateDictSettings:
-        _state_dict_type_to_config: Dict[StateDictType, Type[StateDictConfig]] = {
+        _state_dict_type_to_config: dict[StateDictType, type[StateDictConfig]] = {
             StateDictType.FULL_STATE_DICT: FullStateDictConfig,
             StateDictType.SHARDED_STATE_DICT: ShardedStateDictConfig,
         }
@@ -408,17 +285,25 @@ class YaFSDPModule:
             for state in set(self._get_fsdp_state()._state_ctx.all_states)
             if (param_group := state._fsdp_param_group) is not None
         ]
-        prev_state_dict_types = {param_group._state_dict_type for param_group in param_groups}
+        prev_state_dict_types = {
+            param_group._state_dict_type for param_group in param_groups
+        }
         if len(prev_state_dict_types) != 1:
-            raise AssertionError(f"YaFSDP expects uniform state_dict_type but got {prev_state_dict_types}")
+            raise AssertionError(
+                f"YaFSDP expects uniform state_dict_type but got {prev_state_dict_types}"
+            )
         prev_state_dict_type = next(iter(prev_state_dict_types))
         prev_state_dict_configs = []
         for param_group in param_groups:
-            if (prev_state_dict_config := param_group._state_dict_config) in prev_state_dict_configs:
+            if (
+                prev_state_dict_config := param_group._state_dict_config
+            ) in prev_state_dict_configs:
                 continue
             prev_state_dict_configs.append(prev_state_dict_config)
         if len(prev_state_dict_configs) != 1:
-            raise AssertionError(f"YaFSDP expects uniform state_dict_config but got {prev_state_dict_configs}")
+            raise AssertionError(
+                f"YaFSDP expects uniform state_dict_config but got {prev_state_dict_configs}"
+            )
         prev_state_dict_config = next(iter(prev_state_dict_configs))
         for param_group in param_groups:
             param_group._state_dict_type = state_dict_type
@@ -430,7 +315,7 @@ class YaFSDPModule:
     def state_dict_type(
         self,
         state_dict_type: StateDictType,
-        state_dict_config: Optional[StateDictConfig] = None,
+        state_dict_config: StateDictConfig | None = None,
     ) -> Generator:
         prev_state_dict_settings = self.set_state_dict_type(
             state_dict_type,

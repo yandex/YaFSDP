@@ -7,8 +7,12 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 from torch.distributed.tensor._op_schema import _is_inplace_op, _is_out_variant_op
 from torch.distributed.tensor.placement_types import Placement, Shard, _StridedShard
-from torch.optim.optimizer import _foreach_supported_types as _optim_foreach_supported_types
-from torch.utils._foreach_utils import _foreach_supported_types as _util_foreach_supported_types
+from torch.optim.optimizer import (
+    _foreach_supported_types as _optim_foreach_supported_types,
+)
+from torch.utils._foreach_utils import (
+    _foreach_supported_types as _util_foreach_supported_types,
+)
 
 try:
     from torch.utils import _cxx_pytree as pytree
@@ -66,7 +70,9 @@ class YaFSDPDTensor(DTensor):
 
     @staticmethod
     def __tensor_unflatten__(inner_tensors, flatten_spec, outer_size, outer_stride):
-        assert flatten_spec is not None, "Expecting spec to be not None from `__tensor_flatten__` return value!"
+        assert flatten_spec is not None, (
+            "Expecting spec to be not None from `__tensor_flatten__` return value!"
+        )
         local_tensor = inner_tensors["_local_tensor"]
         spec, requires_grad = flatten_spec
         unflatten_tensor_meta = TensorMeta(
@@ -89,18 +95,26 @@ class YaFSDPDTensor(DTensor):
 
     @classmethod
     @torch._disable_dynamo
-    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):  # noqa: PLR0912
         op_call = func
         kwargs = kwargs or {}
-        flat_args_kwargs = (*pytree.tree_flatten(args)[0], *pytree.tree_flatten(kwargs)[0])
-        arg_to_spec = {arg: arg._spec for arg in flat_args_kwargs if isinstance(arg, YaFSDPDTensor)}
+        flat_args_kwargs = (
+            *pytree.tree_flatten(args)[0],
+            *pytree.tree_flatten(kwargs)[0],
+        )
+        arg_to_spec = {
+            arg: arg._spec for arg in flat_args_kwargs if isinstance(arg, YaFSDPDTensor)
+        }
         for arg, spec in arg_to_spec.items():
             arg._spec = DTensorSpec(
                 spec.mesh,
                 (
                     (
                         Shard(0)
-                        if isinstance((first_placement := (placements := spec.placements)[0]), YaFSDPShard)
+                        if isinstance(
+                            (first_placement := (placements := spec.placements)[0]),
+                            YaFSDPShard,
+                        )
                         else (
                             _StridedShard(0, first_placement.split_factor)
                             if isinstance(first_placement, _YaFSDPStridedShard)
@@ -122,7 +136,11 @@ class YaFSDPDTensor(DTensor):
 
         DTensor._op_dispatcher.sharding_propagator.propagate(op_info)
         output_sharding = op_info.output_sharding
-        output_sharding.output_spec = None if output_sharding.output_spec is None else next(iter(arg_to_spec.values()))
+        output_sharding.output_spec = (
+            None
+            if output_sharding.output_spec is None
+            else next(iter(arg_to_spec.values()))
+        )
         for arg, spec in arg_to_spec.items():
             arg._spec = spec
         logger.debug("output_sharding for %s: %s", op_call, output_sharding)
@@ -135,13 +153,15 @@ class YaFSDPDTensor(DTensor):
                 raise NotImplementedError
 
             local_tensor_args = (
-                pytree.tree_unflatten(cast(list[object], op_info.local_args), op_info.args_tree_spec)
+                pytree.tree_unflatten(
+                    cast("list[object]", op_info.local_args), op_info.args_tree_spec
+                )
                 if op_info.args_tree_spec
                 else op_info.local_args
             )
 
             # run local op computation with potentially modified args/kwargs
-            local_tensor_args = cast(tuple[object, ...], local_tensor_args)
+            local_tensor_args = cast("tuple[object, ...]", local_tensor_args)
             if op_call in DTensor._op_dispatcher._random_ops:
                 raise NotImplementedError
             else:
@@ -168,15 +188,15 @@ class YaFSDPDTensor(DTensor):
             spec = output_sharding.output_spec
             if isinstance(res, torch.Tensor):
                 if spec is not None:
-                    assert isinstance(
-                        spec, YaFSDPDTensorSpec
-                    ), f"output spec does not match with output! Expected DTensorSpec, got {spec}."
+                    assert isinstance(spec, YaFSDPDTensorSpec), (
+                        f"output spec does not match with output! Expected DTensorSpec, got {spec}."
+                    )
                     return YaFSDPDTensor(res, spec, requires_grad=res.requires_grad)
                 else:
                     # if output does not have a DTensorSpec due to specific ops, it must be a scalar tensor
                     assert res.ndim == 0, "output tensor should be scalar!"
                     return res
-            elif isinstance(res, (list, tuple)):
+            elif isinstance(res, list | tuple):
                 raise NotImplementedError
             else:
                 # if the res contains only non tensor values (i.e. int/float/none), we simply return it

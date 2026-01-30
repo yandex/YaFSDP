@@ -2,7 +2,6 @@
   ".":"ml/torch/ya-fsdp",
   ".devcontainer.json":"ml/torch/ya-fsdp/.devcontainer.json",
   ".dockerignore":"ml/torch/ya-fsdp/.dockerignore",
-  ".flake8":"ml/torch/ya-fsdp/.flake8",
   ".gitignore":"ml/torch/ya-fsdp/.gitignore",
   ".markdownlint.json":"ml/torch/ya-fsdp/.markdownlint.json",
   "CITATION.cff":"ml/torch/ya-fsdp/CITATION.cff",
@@ -18,7 +17,7 @@
   "examples/clm.md":"ml/torch/ya-fsdp/examples/clm.md",
   "examples/fsdp_config.yaml":"ml/torch/ya-fsdp/examples/fsdp_config.yaml",
   "examples/sft.md":"ml/torch/ya-fsdp/examples/sft.md",
-  "mypy.ini":"ml/torch/ya-fsdp/mypy.ini",
+  "justfile":"ml/torch/ya-fsdp/justfile",
   "patches/accelerate.diff":"ml/torch/ya-fsdp/patches/accelerate.diff",
   "patches/transformers.diff":"ml/torch/ya-fsdp/patches/transformers.diff",
   "patches/trl.diff":"ml/torch/ya-fsdp/patches/trl.diff",
@@ -34,5 +33,6 @@
   "ya_fsdp/_tensor.py":"ml/torch/ya-fsdp/ya_fsdp/_tensor.py",
   "ya_fsdp/fully_shard.py":"ml/torch/ya-fsdp/ya_fsdp/fully_shard.py",
   "ya_fsdp/meta_param.py":"ml/torch/ya-fsdp/ya_fsdp/meta_param.py",
+  "ya_fsdp/py.typed":"ml/torch/ya-fsdp/ya_fsdp/py.typed",
   "ya_fsdp/ya_fsdp.py":"ml/torch/ya-fsdp/ya_fsdp/ya_fsdp.py"
 }

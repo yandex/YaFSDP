@@ -1,16 +1,47 @@
+# Package ######################################################################
+
 [project]
+name = "ya-fsdp"
 version = "0.1.0"
-name = "ya_fsdp"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch",
+]
 
-[tool.setuptools.packages.find]
-include = ["ya_fsdp"]
+[project.optional-dependencies]
+dev = [
+    "codespell",
+    "mypy",
+    "ruff",
+    "torchfix",
+]
 
-[tool.isort]
-profile = "black"
-py_version = "310"
-line_length = 120
+[build-system]
+requires = ["uv_build>=0.9.15,<0.10.0"]
+build-backend = "uv_build"
 
-[tool.black]
-line-length = 120
-target-version = ["py310"]
-required-version = "23.7.0"
+[tool.uv.build-backend]
+module-root = ""
+
+# Linter tools #################################################################
+
+[tool.ruff]
+extend = "../ydt/pyproject.toml"
+extend-exclude = ["ya_fsdp/ya_fsdp.py", "ya_fsdp/meta_param.py"]
+force-exclude = true
+
+[tool.mypy]
+files = ["ya_fsdp"]
+strict = true
+allow_redefinition = true
+disallow_untyped_calls = false
+
+[[tool.mypy.overrides]]
+module = [
+    "yccl.*",
+]
+ignore_missing_imports = true
+
+[tool.codespell]
+ignore-words-list = ["nd"]
