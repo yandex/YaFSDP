@@ -27,12 +27,40 @@ module-root = ""
 # Linter tools #################################################################
 
 [tool.ruff]
-extend = "../ydt/pyproject.toml"
 extend-exclude = ["ya_fsdp/ya_fsdp.py", "ya_fsdp/meta_param.py"]
 force-exclude = true
 
+[tool.ruff.lint]
+extend-select = [
+    "B",
+    "C4",
+    "D",
+    "FURB",
+    "G",
+    "I",
+    "LOG",
+    "N",
+    "PERF",
+    "PL",
+    "RSE",
+    "RUF",
+    "TC",
+    "TID",
+    "UP",
+    "W",
+]
+ignore = [
+    "D1",
+    "PLR0402",
+    "PLR0913",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
 [tool.mypy]
 files = ["ya_fsdp"]
+exclude = "(ya_fsdp/ya_fsdp.py|ya_fsdp/meta_param.py)"
 strict = true
 allow_redefinition = true
 disallow_untyped_calls = false

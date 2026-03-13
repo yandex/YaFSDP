@@ -18,7 +18,7 @@ type-check:
 spell-check:
     codespell
 
-check: format-check lint-check spell-check
+check: format-check lint-check type-check spell-check
 
 fix: format-fix lint-fix
 

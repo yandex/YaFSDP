@@ -1,17 +1,18 @@
 import traceback
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any
+from typing import Any, NoReturn
 
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import DeviceMesh
+import torch.nn as nn
+from torch.distributed._composable.contract import _get_registry
+from torch.distributed.device_mesh import DeviceMesh
 
 
 @dataclass
 class DataParallelMeshInfo:
     mesh: DeviceMesh
-    intra_node_group: dist.ProcessGroup
     shard_mesh_dim: int | None = None
     replicate_mesh_dim: int | None = None
 
@@ -44,11 +45,19 @@ class TrainingState(Enum):
     IDLE = auto()
 
 
-def _raise_assert_with_print(*args: Any, **kwargs: Any):
+def _raise_assert_with_print(*args: Any, **kwargs: Any) -> NoReturn:
     print(f"[Rank {dist.get_rank()}] ", end="")
     print(*args, **kwargs)
     traceback.print_stack()
     raise AssertionError(*args, **kwargs)
+
+
+def _is_composable_with_fsdp(module: nn.Module) -> bool:
+    registry = _get_registry(module)
+    if registry is None:
+        return True
+    # Registry keys by function name
+    return "replicate" not in registry
 
 
 def _cast_fp_tensor(dtype: torch.dtype, x: torch.Tensor) -> torch.Tensor:
@@ -59,3 +68,7 @@ def _cast_fp_tensor(dtype: torch.dtype, x: torch.Tensor) -> torch.Tensor:
     ):
         return x
     return x.to(dtype)
+
+
+def is_bw() -> bool:
+    return torch._C._current_graph_task_id() != -1

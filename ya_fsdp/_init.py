@@ -4,7 +4,7 @@ import logging
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch._logging import warning_once
+from torch._logging import warning_once  # type: ignore[attr-defined]
 from torch.distributed.device_mesh import (
     DeviceMesh,
     _get_device_handle,
@@ -13,8 +13,7 @@ from torch.distributed.device_mesh import (
 from torch.distributed.tensor import DTensor
 from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
-from ._common import FSDPMeshInfo
-from ._param import ParamModuleInfo, unsafe_setattr_param
+from ._common import FSDPMeshInfo, _is_composable_with_fsdp
 from ._state import _get_module_fsdp_state
 
 logger = logging.getLogger("ya_fsdp")
@@ -131,7 +130,9 @@ def _get_managed_modules(
     visited_modules: set[nn.Module] = set()
 
     def dfs(module: nn.Module) -> None:
-        if (
+        if not _is_composable_with_fsdp(module):
+            return
+        elif (
             module not in root_modules_set
             and _get_module_fsdp_state(module) is not None
         ):
@@ -191,15 +192,10 @@ def _get_managed_states(
 def _move_states_to_device(
     params: list[nn.Parameter],
     buffers: list[torch.Tensor],
-    param_module_infos: list[ParamModuleInfo],
     device: torch.device,
-    param_dtype: torch.dtype | None = None,
 ) -> None:
     # Follow the logic in `nn.Module._apply`
-    for tensor, module_info in itertools.chain(
-        zip(params, param_module_infos, strict=False),
-        zip(buffers, (None for _ in range(len(buffers))), strict=False),
-    ):
+    for tensor in itertools.chain(params, buffers):
         if tensor.device == device:
             continue
         if isinstance(tensor, DTensor):
@@ -208,70 +204,14 @@ def _move_states_to_device(
                     "Requires DTensor to have mesh of the same type as the FSDP mesh "
                     f"but got {dtensor_mesh_type} for DTensor and {device.type} for FSDP"
                 )
-            raise AssertionError(
-                f"Expects DTensor to be moved to {dtensor_mesh_type} but got {tensor.device}"
-            )
-        if module_info is not None:
-            if is_traceable_wrapper_subclass(tensor):
-                inner_tensors, flatten_spec = tensor.__tensor_flatten__()
-                inner_tensors = {
-                    attr_name: torch.empty_like(
-                        inner_tensor,
-                        dtype=param_dtype if isinstance(tensor, nn.Parameter) else None,
-                        device=device,
-                    )
-                    if (inner_tensor := getattr(tensor, attr_name)).is_meta
-                    else inner_tensor.to(
-                        dtype=param_dtype if isinstance(tensor, nn.Parameter) else None,
-                        device=device,
-                    )
-                    for attr_name in inner_tensors
-                }
-                new_tensor = tensor.__tensor_unflatten__(
-                    inner_tensors, flatten_spec, None, None
-                )
-            else:
-                new_tensor = (
-                    torch.empty_like(
-                        tensor,
-                        dtype=param_dtype if isinstance(tensor, nn.Parameter) else None,
-                        device=device,
-                    )
-                    if tensor.is_meta
-                    else tensor.to(
-                        dtype=param_dtype if isinstance(tensor, nn.Parameter) else None,
-                        device=device,
-                    )
-                )
-            param = nn.Parameter(new_tensor, requires_grad=tensor.requires_grad)
-            unsafe_setattr_param(module_info.module, module_info.param_name, param)
-            for shared_module, shared_param_name in zip(
-                module_info.shared_modules, module_info.shared_param_names, strict=False
-            ):
-                unsafe_setattr_param(shared_module, shared_param_name, param)
+        tensor_ = tensor
+        if tensor.is_meta:
+            with torch.no_grad():  # avoid autograd increasing C++ refcount by 1
+                tensor_on_device = nn.Parameter(torch.empty_like(tensor, device=device))
+            torch.utils.swap_tensors(tensor, tensor_on_device)
+        elif is_traceable_wrapper_subclass(tensor_):
+            with torch.no_grad():  # avoid autograd increasing C++ refcount by 1
+                tensor_on_device = nn.Parameter(tensor.to(device))
+            torch.utils.swap_tensors(tensor, tensor_on_device)
         else:
-            tensor.data = tensor.to(
-                dtype=param_dtype if isinstance(tensor, nn.Parameter) else None,
-                device=device,
-            )
-
-
-def _sync_states(
-    params: list[nn.Parameter],
-    buffers: list[torch.Tensor],
-    process_group: dist.ProcessGroup,
-    broadcast_bucket_size: int = 250 * 1024 * 1024,
-    src: int = 0,
-):
-    states = [*(p.detach() for p in params), *buffers]
-    if len(states) > 0:
-        dist._broadcast_coalesced(
-            process_group,
-            [
-                state.to_local() if isinstance(state, DTensor) else state
-                for state in states
-            ],
-            broadcast_bucket_size,
-            src,
-        )
-        torch.cuda.empty_cache()
+            tensor.data = tensor.to(device)

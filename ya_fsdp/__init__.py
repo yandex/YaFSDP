@@ -1,10 +1,12 @@
-from ._api import FullStateDictConfig, MixedPrecisionPolicy, StateDictType
-from .fully_shard import fully_shard
+from ._api import MixedPrecisionPolicy
+from ._tensor import RaggedShard, RaggedShardDTensor
+from .fully_shard import UnshardHandle, YaFSDPModule, fully_shard
 
 __all__ = [
-    "FullStateDictConfig",
     "MixedPrecisionPolicy",
-    "StateDictType",
-    "YaFSDP",
+    "RaggedShard",
+    "RaggedShardDTensor",
+    "UnshardHandle",
+    "YaFSDPModule",
     "fully_shard",
 ]
