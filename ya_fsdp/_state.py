@@ -128,6 +128,7 @@ class YaFSDPState(_State):
         self,
         allow_no_grad_reduce: bool = False,
         yccl_handle: "yccl.Handle | None" = None,
+        process_group_to_yccl_handle: "dict[torch.distributed.ProcessGroup, yccl.Handle] | None" = None,
         param_group_to_data_buffer_ctx_idx: dict[YaFSDPParamGroup, int] | None = None,
         param_group_to_grad_buffer_ctx_idx: dict[YaFSDPParamGroup, int] | None = None,
         data_buffer_ctx_idx_to_yccl_handle: dict[int, "yccl.Handle"] | None = None,
@@ -160,6 +161,7 @@ class YaFSDPState(_State):
         self._init_shared_state(
             allow_no_grad_reduce,
             yccl_handle,
+            process_group_to_yccl_handle,
             param_group_to_data_buffer_ctx_idx,
             param_group_to_grad_buffer_ctx_idx,
             data_buffer_ctx_idx_to_yccl_handle,
@@ -176,6 +178,7 @@ class YaFSDPState(_State):
         self,
         allow_no_grad_reduce: bool,
         yccl_handle: "yccl.Handle | None",
+        process_group_to_yccl_handle: "dict[torch.distributed.ProcessGroup, yccl.Handle] | None",
         param_group_to_data_buffer_ctx_idx: dict[YaFSDPParamGroup, int] | None,
         param_group_to_grad_buffer_ctx_idx: dict[YaFSDPParamGroup, int] | None,
         data_buffer_ctx_idx_to_yccl_handle: "dict[int, yccl.Handle] | None",
@@ -202,6 +205,8 @@ class YaFSDPState(_State):
                 param_groups,
                 "data_buffer_ctx",
                 None if no_reshard_after_forward else 2,
+                yccl_handle,
+                process_group_to_yccl_handle,
                 param_group_to_data_buffer_ctx_idx,
                 data_buffer_ctx_idx_to_yccl_handle,
             )
@@ -215,6 +220,8 @@ class YaFSDPState(_State):
                 ],
                 "grad_buffer_ctx",
                 None if allow_no_grad_reduce else 1,
+                yccl_handle,
+                process_group_to_yccl_handle,
                 param_group_to_grad_buffer_ctx_idx,
                 grad_buffer_ctx_idx_to_yccl_handle,
             )
@@ -239,11 +246,7 @@ class YaFSDPState(_State):
             data_buffer_ctx.lazy_init(
                 buffer_size_in_bytes,
                 self._device,
-                yccl_handle=(
-                    yccl_handle
-                    if data_buffer_ctx2yccl_handle is None
-                    else data_buffer_ctx2yccl_handle[data_buffer_ctx]
-                ),
+                yccl_handle=data_buffer_ctx2yccl_handle[data_buffer_ctx],
             )
             for param_group in ctx_using_param_groups:
                 param_group.data_buffer_ctx = data_buffer_ctx
@@ -271,11 +274,7 @@ class YaFSDPState(_State):
             grad_buffer_ctx.lazy_init(
                 buffer_size_in_bytes,
                 self._device,
-                yccl_handle=(
-                    yccl_handle
-                    if grad_buffer_ctx2yccl_handle is None
-                    else grad_buffer_ctx2yccl_handle[grad_buffer_ctx]
-                ),
+                yccl_handle=grad_buffer_ctx2yccl_handle[grad_buffer_ctx],
             )
             for param_group in ctx_using_param_groups:
                 param_group.grad_buffer_ctx = grad_buffer_ctx
@@ -610,11 +609,13 @@ def get_buffer_ctx2ctx_using_param_groups_map(
     param_groups: list[YaFSDPParamGroup],
     buffer_ctx_attr_name: str,
     num_buffers_per_process_group: int | None,
+    yccl_handle: "yccl.Handle | None",
+    process_group_to_yccl_handle: "dict[torch.distributed.ProcessGroup, yccl.Handle] | None",
     param_group_to_buffer_ctx_idx: dict[YaFSDPParamGroup, int] | None = None,
     buffer_ctx_idx_to_yccl_handle: "dict[int, yccl.Handle] | None" = None,
 ) -> tuple[
     dict[YaFSDPBufferContext, list[YaFSDPParamGroup]],
-    "dict[YaFSDPBufferContext, list[yccl.Handle]] | None",
+    "dict[YaFSDPBufferContext, list[yccl.Handle | None]]",
 ]:
     process_group_to_param_groups: dict[
         torch.distributed.ProcessGroup, list[YaFSDPParamGroup]
@@ -648,8 +649,7 @@ def get_buffer_ctx2ctx_using_param_groups_map(
     buffer_ctx2ctx_using_param_groups: dict[
         YaFSDPBufferContext, list[YaFSDPParamGroup]
     ] = {}
-    if buffer_ctx_idx_to_yccl_handle is not None:
-        buffer_ctx2yccl_handle = {}
+    buffer_ctx2yccl_handle = {}
     for param_group in param_groups:
         buffer_ctx_idx = param_group_to_buffer_ctx_idx[param_group]
         buffer_ctx2ctx_using_param_groups.setdefault(
@@ -660,7 +660,10 @@ def get_buffer_ctx2ctx_using_param_groups_map(
             buffer_ctx2yccl_handle[buffer_ctx] = buffer_ctx_idx_to_yccl_handle[
                 buffer_ctx_idx
             ]
-    return (
-        buffer_ctx2ctx_using_param_groups,
-        buffer_ctx2yccl_handle if buffer_ctx_idx_to_yccl_handle else None,
-    )
+        elif process_group_to_yccl_handle is not None:
+            buffer_ctx2yccl_handle[buffer_ctx] = process_group_to_yccl_handle[
+                param_group.mesh_info.shard_process_group
+            ]
+        else:
+            buffer_ctx2yccl_handle[buffer_ctx] = yccl_handle
+    return buffer_ctx2ctx_using_param_groups, buffer_ctx2yccl_handle
