@@ -1,6 +1,7 @@
 import logging
 import operator
 import warnings
+from dataclasses import dataclass
 from functools import reduce
 from typing import Any, cast
 
@@ -37,17 +38,17 @@ from torch.utils._foreach_utils import (
 logger = logging.getLogger("ya_fsdp")
 
 
-class RaggedShard(Placement):
-    def __init__(
-        self, local_numel: int, global_offset: int, shard_numels: tuple[int, ...]
-    ) -> None:
-        super().__init__()
-        self.local_numel = local_numel
-        self.global_offset = global_offset
-        self.shard_numels = shard_numels
+@dataclass(frozen=True)
+class RaggedShard:
+    local_numel: int
+    global_offset: int
+    shard_numels: tuple[int, ...]
 
     def __repr__(self) -> str:
         return f"RaggedShard(local_numel={self.local_numel}, global_offset={self.global_offset})"
+
+    def __str__(self) -> str:
+        return f"RS({self.local_numel}, {self.global_offset})"
 
 
 class RaggedShardDTensor(torch.Tensor):
@@ -145,6 +146,8 @@ class RaggedShardDTensor(torch.Tensor):
         elif func in (
             torch.ops.aten.empty_like.default,
             torch.ops.aten.zeros_like.default,
+            torch.ops.aten.new_zeros.default,
+            torch.ops.aten.new_empty.default,
         ):
             arg, *args = args
             return RaggedShardDTensor(
@@ -347,7 +350,7 @@ class RaggedShardDTensor(torch.Tensor):
                 type=WriteItemType.SHARD,
                 tensor_data=TensorWriteData(
                     chunk=ChunkStorageMetadata(offsets=offsets, sizes=sizes),
-                    properties=TensorProperties.create_from_tensor(self.to_local()),
+                    properties=TensorProperties.create_from_tensor(self._local_tensor),
                     size=torch.Size((reduce(operator.mul, self.size(), 1),)),
                 ),
             )

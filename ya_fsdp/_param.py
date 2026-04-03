@@ -93,10 +93,13 @@ class YaFSDPParam:
         del self.param
         del self.param_data
         self.is_dtensor = isinstance(param, DTensor)
-        fsdp_placement = RaggedShard(
-            local_numel=sharded_param_data.numel(),
-            global_offset=global_offset,
-            shard_numels=shard_numels,
+        fsdp_placement = cast(
+            "Placement",
+            RaggedShard(
+                local_numel=sharded_param_data.numel(),
+                global_offset=global_offset,
+                shard_numels=shard_numels,
+            ),
         )
         if self.is_dtensor:
             self._tp_spec = cast("DTensor", param)._spec
@@ -118,12 +121,10 @@ class YaFSDPParam:
                     "_spmd_mesh.ndim can only be 2 (FSDP+EP) "
                     f"but got {self._spmd_mesh.ndim}."
                 )
-            self._spmd_placements: tuple[Placement, ...]
-            dp_shard_tp_placement = (
+            self._spmd_placements: tuple[Placement, ...] = (
                 fsdp_placement,
                 *self._tp_spec.placements,
             )
-            self._spmd_placements = dp_shard_tp_placement
             self._sharding_spec = DTensorSpec(
                 self._spmd_mesh,
                 self._spmd_placements,
