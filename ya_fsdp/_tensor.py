@@ -312,7 +312,10 @@ class RaggedShardDTensor(torch.Tensor):
                 scalar_list,
                 **kwargs,
             )
-        elif func == torch.ops.aten._fused_adam_.default:
+        elif func in (
+            torch.ops.aten._fused_adam_.default,
+            torch.ops.aten._fused_adamw_.default,
+        ):
             args1, args2, args3, args4, args5, args6 = args
             assert len(args5) == 0
             func(
