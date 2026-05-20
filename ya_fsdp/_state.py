@@ -231,22 +231,25 @@ class YaFSDPState(_State):
             data_buffer_ctx,
             ctx_using_param_groups,
         ) in data_buffer_ctx2ctx_using_param_groups.items():
-            buffer_size_in_bytes = max(
-                sum(
-                    numel
-                    * (
-                        all_gather_dtype
-                        or param_group.param_dtype
-                        or param_group.orig_dtype
-                    ).itemsize
-                    for all_gather_dtype, numel in param_group.padded_unsharded_param_numel.items()
-                )
+            all_gather_dtypes = {
+                dtype
                 for param_group in ctx_using_param_groups
-            )
+                for dtype in param_group.padded_unsharded_param_numel
+            }
+            default_handle = data_buffer_ctx2yccl_handle[data_buffer_ctx]
             data_buffer_ctx.lazy_init(
-                buffer_size_in_bytes,
+                {
+                    dtype: max(
+                        param_group.padded_unsharded_param_numel.get(dtype, 0)
+                        * (
+                            dtype or param_group.param_dtype or param_group.orig_dtype
+                        ).itemsize
+                        for param_group in ctx_using_param_groups
+                    )
+                    for dtype in all_gather_dtypes
+                },
                 self._device,
-                yccl_handle=data_buffer_ctx2yccl_handle[data_buffer_ctx],
+                yccl_handles=dict.fromkeys(all_gather_dtypes, default_handle),
             )
             for param_group in ctx_using_param_groups:
                 param_group.data_buffer_ctx = data_buffer_ctx
@@ -259,22 +262,27 @@ class YaFSDPState(_State):
             grad_buffer_ctx,
             ctx_using_param_groups,
         ) in grad_buffer_ctx2ctx_using_param_groups.items():
-            buffer_size_in_bytes = max(
-                sum(
-                    numel
-                    * (
-                        param_group.reduce_dtype
-                        or param_group.param_dtype
-                        or param_group.orig_dtype
-                    ).itemsize
-                    for numel in param_group.padded_unsharded_param_numel.values()
-                )
+            all_gather_dtypes = {
+                dtype
                 for param_group in ctx_using_param_groups
-            )
+                for dtype in param_group.padded_unsharded_param_numel
+            }
+            default_handle = grad_buffer_ctx2yccl_handle[grad_buffer_ctx]
             grad_buffer_ctx.lazy_init(
-                buffer_size_in_bytes,
+                {
+                    dtype: max(
+                        param_group.padded_unsharded_param_numel.get(dtype, 0)
+                        * (
+                            param_group.reduce_dtype
+                            or param_group.param_dtype
+                            or param_group.orig_dtype
+                        ).itemsize
+                        for param_group in ctx_using_param_groups
+                    )
+                    for dtype in all_gather_dtypes
+                },
                 self._device,
-                yccl_handle=grad_buffer_ctx2yccl_handle[grad_buffer_ctx],
+                yccl_handles=dict.fromkeys(all_gather_dtypes, default_handle),
             )
             for param_group in ctx_using_param_groups:
                 param_group.grad_buffer_ctx = grad_buffer_ctx
@@ -508,16 +516,17 @@ class YaFSDPState(_State):
                 if self._state_ctx.is_last_backward:
                     state._finalize_backward()
                 if fsdp_param_group is not None:
-                    if (
-                        yccl_handle := fsdp_param_group.data_buffer_ctx.yccl_handle
-                    ) is not None:
-                        yccl_handle.process_profiling_events()
+                    for (
+                        yccl_handle
+                    ) in fsdp_param_group.data_buffer_ctx.yccl_handles.values():
+                        if yccl_handle is not None:
+                            yccl_handle.process_profiling_events()
                     if (
                         grad_buffer_ctx := fsdp_param_group.grad_buffer_ctx
-                    ) is not None and (
-                        yccl_handle := grad_buffer_ctx.yccl_handle
                     ) is not None:
-                        yccl_handle.process_profiling_events()
+                        for yccl_handle in grad_buffer_ctx.yccl_handles.values():
+                            if yccl_handle is not None:
+                                yccl_handle.process_profiling_events()
             if self._state_ctx.is_last_backward:
                 self._comm_ctx.post_forward_order.clear()
             self._state_ctx.post_backward_final_callback_queued = False

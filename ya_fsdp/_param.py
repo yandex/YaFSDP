@@ -208,6 +208,8 @@ class YaFSDPParam:
         inner_tensor = self._sharded_local_tensor
         unsharded_tensor = all_gather_output.view(self._orig_size)
         if hasattr(inner_tensor, "fsdp_post_all_gather"):
+            # Save the raw view so to_unsharded() can pass it on each forward.
+            self._all_gather_output: torch.Tensor = unsharded_tensor
             unsharded_tensor, _ = inner_tensor.fsdp_post_all_gather(
                 (unsharded_tensor,),
                 self._extensions_data.all_gather_metadata,
@@ -234,6 +236,23 @@ class YaFSDPParam:
 
     def to_unsharded(self) -> None:
         # Assume that the data has been allocated and all-gathered
+        inner_tensor = self._sharded_local_tensor
+        has_post = hasattr(inner_tensor, "fsdp_post_all_gather")
+        meta_set = has_post and self._extensions_data.all_gather_metadata is not None
+        if meta_set:
+            # Refresh per-forward state (e.g. FP8 quantization scales) on the
+            # existing unsharded tensor without reallocating it.  The data
+            # buffer is already correct because it aliases the all-gather output.
+            unsharded_inner = self.unsharded_param
+            if self.is_dtensor:
+                unsharded_inner = cast("DTensor", unsharded_inner)._local_tensor  # type: ignore[assignment]
+            inner_tensor.fsdp_post_all_gather(  # type: ignore[attr-defined]
+                (self._all_gather_output,),
+                self._extensions_data.all_gather_metadata,
+                self.param_dtype or self.orig_dtype,
+                out=unsharded_inner,
+            )
+
         self._setattr_on_modules(self.unsharded_param)
         self.sharded_state = ShardedState.UNSHARDED
 

@@ -44,7 +44,7 @@ def all_gather(
 ) -> AllGatherResult:
     device_handle = _get_device_handle(device.type)
     with device_handle.stream(all_gather_stream):
-        if not param_group.is_all_gather_input_set:
+        if all_gather_dtype not in param_group._all_gather_input_set_dtypes:
             for fsdp_param in fsdp_params:
                 fsdp_param.set_all_gather_input()
             if all_gather_dtype is None and (
@@ -52,7 +52,7 @@ def all_gather(
             ):
                 with torch.autograd._unsafe_preserve_version_counter(all_gather_input):  # type: ignore[attr-defined]
                     all_gather_input.copy_(padded_sharded_param_data)
-            param_group.is_all_gather_input_set = True
+            param_group._all_gather_input_set_dtypes.add(all_gather_dtype)
         if yccl_handle is None:
             all_gather_work = dist.all_gather_into_tensor(
                 output_tensor=all_gather_output,
@@ -88,7 +88,7 @@ def sizes_to_slices(sizes: list[int]) -> list[slice]:
 
 
 def reduce_scatter(
-    param_group: "YaFSDPParamGroup",
+    fsdp_params: "list[YaFSDPParam]",
     fsdp_params_with_grad: list[YaFSDPParam],
     padded_sharded_param_grad: torch.Tensor,
     padded_unsharded_param_grad: torch.Tensor,
@@ -113,7 +113,7 @@ def reduce_scatter(
             )
             and all(
                 fsdp_param.sharded_param.grad is None
-                for fsdp_param in param_group.fsdp_params
+                for fsdp_param in fsdp_params
                 if fsdp_param.sharded_param.requires_grad
             )
             and yccl_handle is None
@@ -152,7 +152,7 @@ def reduce_scatter(
         if not reduce_in_sharded:
             fsdp_params_which_require_grad = [
                 fsdp_param
-                for fsdp_param in param_group.fsdp_params
+                for fsdp_param in fsdp_params
                 if fsdp_param.sharded_param.requires_grad
             ]
             fsdp_params_without_sharded_grad = [
