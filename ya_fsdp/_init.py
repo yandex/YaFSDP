@@ -207,7 +207,10 @@ def _move_states_to_device(
         tensor_ = tensor
         if tensor.is_meta:
             with torch.no_grad():  # avoid autograd increasing C++ refcount by 1
-                tensor_on_device = nn.Parameter(torch.empty_like(tensor, device=device))
+                tensor_on_device = nn.Parameter(
+                    torch.empty_like(tensor, device=device),
+                    requires_grad=tensor.requires_grad,
+                )
             torch.utils.swap_tensors(tensor, tensor_on_device)
         elif is_traceable_wrapper_subclass(tensor_):
             with torch.no_grad():  # avoid autograd increasing C++ refcount by 1
