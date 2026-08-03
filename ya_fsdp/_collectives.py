@@ -53,7 +53,10 @@ def all_gather(
                 with torch.autograd._unsafe_preserve_version_counter(all_gather_input):  # type: ignore[attr-defined]
                     all_gather_input.copy_(padded_sharded_param_data)
             param_group._all_gather_input_set_dtypes.add(all_gather_dtype)
-        if yccl_handle is None:
+        if all_gather_group.size() == 1:
+            all_gather_output.copy_(all_gather_input)
+            all_gather_work = None
+        elif yccl_handle is None:
             all_gather_work = dist.all_gather_into_tensor(
                 output_tensor=all_gather_output,
                 input_tensor=all_gather_input,
@@ -134,7 +137,18 @@ def reduce_scatter(
             )
         )
         _div_if_needed(padded_unsharded_param_grad, predivide_factor)
-        if yccl_handle is None:
+        if reduce_scatter_group.size() == 1:
+            if (
+                gradient_divide_factor is not None
+                and predivide_factor is None
+                and postdivide_factor is None
+            ):
+                output_tensor.copy_(
+                    padded_unsharded_param_grad / gradient_divide_factor
+                )
+            else:
+                output_tensor.copy_(padded_unsharded_param_grad)
+        elif yccl_handle is None:
             dist.reduce_scatter_tensor(
                 output_tensor,
                 padded_unsharded_param_grad,
