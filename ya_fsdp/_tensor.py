@@ -131,31 +131,8 @@ class RaggedShardDTensor(torch.Tensor):
                 arg._spec,
                 requires_grad=False,
             )
-        elif func == torch.ops.aten.clone.default:
-            (arg,) = args
-            assert len(kwargs) == 0
-            return RaggedShardDTensor(
-                arg._local_tensor.clone(),
-                arg._spec,
-                requires_grad=False,
-            )
-        elif func == torch.ops.aten.copy_.default:
-            arg1, arg2 = args
-            func(arg1._local_tensor, arg2._local_tensor, **kwargs)
-            return arg1
         elif func in (
-            torch.ops.aten.empty_like.default,
-            torch.ops.aten.zeros_like.default,
-            torch.ops.aten.new_zeros.default,
-            torch.ops.aten.new_empty.default,
-        ):
-            arg, *args = args
-            return RaggedShardDTensor(
-                func(arg._local_tensor, *args, **kwargs),
-                arg._spec,
-                requires_grad=arg.requires_grad,
-            )
-        elif func in (
+            torch.ops.aten.copy_.default,
             torch.ops.aten.log_.default,
             torch.ops.aten.zero_.default,
             torch.ops.aten.mul_.Tensor,
@@ -172,6 +149,12 @@ class RaggedShardDTensor(torch.Tensor):
             )
             return arg
         elif func in (
+            torch.ops.aten.clone.default,
+            torch.ops.aten._to_copy.default,
+            torch.ops.aten.empty_like.default,
+            torch.ops.aten.zeros_like.default,
+            torch.ops.aten.new_zeros.default,
+            torch.ops.aten.new_empty.default,
             torch.ops.aten.exp.default,
             torch.ops.aten.expm1.default,
             torch.ops.aten.log.default,
