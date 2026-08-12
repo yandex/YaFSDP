@@ -128,7 +128,7 @@ class YaFSDPState(_State):
         self,
         allow_no_grad_reduce: bool = False,
         yccl_handle: "yccl.Handle | None" = None,
-        process_group_to_yccl_handle: "dict[torch.distributed.ProcessGroup, yccl.Handle] | None" = None,
+        process_group_to_yccl_handle: "dict[torch.distributed.ProcessGroup, yccl.Handle | None] | None" = None,
         param_group_to_data_buffer_ctx_idx: dict[YaFSDPParamGroup, int] | None = None,
         param_group_to_grad_buffer_ctx_idx: dict[YaFSDPParamGroup, int] | None = None,
         data_buffer_ctx_idx_to_yccl_handle: dict[int, "yccl.Handle"] | None = None,
@@ -178,7 +178,7 @@ class YaFSDPState(_State):
         self,
         allow_no_grad_reduce: bool,
         yccl_handle: "yccl.Handle | None",
-        process_group_to_yccl_handle: "dict[torch.distributed.ProcessGroup, yccl.Handle] | None",
+        process_group_to_yccl_handle: "dict[torch.distributed.ProcessGroup, yccl.Handle | None] | None",
         param_group_to_data_buffer_ctx_idx: dict[YaFSDPParamGroup, int] | None,
         param_group_to_grad_buffer_ctx_idx: dict[YaFSDPParamGroup, int] | None,
         data_buffer_ctx_idx_to_yccl_handle: "dict[int, yccl.Handle] | None",
@@ -619,12 +619,12 @@ def get_buffer_ctx2ctx_using_param_groups_map(
     buffer_ctx_attr_name: str,
     num_buffers_per_process_group: int | None,
     yccl_handle: "yccl.Handle | None",
-    process_group_to_yccl_handle: "dict[torch.distributed.ProcessGroup, yccl.Handle] | None",
+    process_group_to_yccl_handle: "dict[torch.distributed.ProcessGroup, yccl.Handle | None] | None",
     param_group_to_buffer_ctx_idx: dict[YaFSDPParamGroup, int] | None = None,
     buffer_ctx_idx_to_yccl_handle: "dict[int, yccl.Handle] | None" = None,
 ) -> tuple[
     dict[YaFSDPBufferContext, list[YaFSDPParamGroup]],
-    "dict[YaFSDPBufferContext, list[yccl.Handle | None]]",
+    "dict[YaFSDPBufferContext, yccl.Handle | None]",
 ]:
     process_group_to_param_groups: dict[
         torch.distributed.ProcessGroup, list[YaFSDPParamGroup]
