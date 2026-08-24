@@ -564,12 +564,8 @@ class YaFSDPParamGroup:
             all_gather_stream = self.comm_ctx.get_all_gather_stream(
                 async_op, self._training_state
             )
-            if (
-                owner := (data_buffer_ctx := self.data_buffer_ctx).owner
-            ) is not None and owner is not self:
-                raise RuntimeError(
-                    f"{self} tried to acquire its data buffer, but it is in use by {owner}."
-                )
+            if (data_buffer_ctx := self.data_buffer_ctx).owner is not None:
+                data_buffer_ctx.owner.reshard()
             if (release_event := data_buffer_ctx.release_event) is not None:
                 all_gather_stream.wait_event(release_event)
                 data_buffer_ctx.release_event = None
