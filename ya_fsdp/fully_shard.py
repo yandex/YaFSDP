@@ -26,7 +26,7 @@ from ._init import (
     _move_states_to_device,
 )
 from ._param_group import YaFSDPParamGroup
-from ._state import YaFSDPState, _get_module_fsdp_state
+from ._state import YaFSDPState, _get_module_fsdp_state, _LifecycleState
 
 if TYPE_CHECKING:
     from ._collectives import AllGatherResult
@@ -146,11 +146,15 @@ class YaFSDPModule:
 
     def reshard(self) -> None:
         state = self._get_fsdp_state()
+        if state._state_ctx.lifecycle_state is not _LifecycleState.ACTIVE:
+            raise RuntimeError("Cannot reshard suspended YaFSDP; call resume() first")
         if fsdp_param_group := state._fsdp_param_group:
             fsdp_param_group.reshard()
 
     def unshard(self, async_op: bool = False) -> "UnshardHandle | None":
         state = self._get_fsdp_state()
+        if state._state_ctx.lifecycle_state is not _LifecycleState.ACTIVE:
+            raise RuntimeError("Cannot unshard suspended YaFSDP; call resume() first")
         fsdp_param_group = state._fsdp_param_group
         if fsdp_param_group is not None:
             fsdp_param_group.unshard(async_op=async_op)
@@ -159,6 +163,18 @@ class YaFSDPModule:
             return handle
         handle.wait()
         return None
+
+    def suspend(self) -> None:
+        """Park local shards on CPU and release YaFSDP communication buffers.
+
+        This is a collective root-module operation. The module cannot be used
+        until :meth:`resume` completes.
+        """
+        self._get_fsdp_state().suspend()
+
+    def resume(self) -> None:
+        """Restore a suspended root module to its original compute device."""
+        self._get_fsdp_state().resume()
 
     def set_is_last_backward(self, is_last_backward: bool) -> None:
         state = self._get_fsdp_state()
@@ -244,10 +260,12 @@ class YaFSDPModule:
         return state
 
     def _apply(self, *args: Any, **kwargs: Any) -> Any:
+        state = self._get_fsdp_state()
+        if state._state_ctx.lifecycle_state is not _LifecycleState.ACTIVE:
+            raise RuntimeError("Cannot convert suspended YaFSDP; call resume() first")
         # Reshard to ensure that sharded parameters are registered
         self.reshard()
         ret = super()._apply(*args, **kwargs)  # type: ignore[misc]
-        state = self._get_fsdp_state()
         if not (fsdp_param_group := state._fsdp_param_group):
             return ret
         with torch.no_grad():

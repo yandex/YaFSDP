@@ -37,6 +37,28 @@ class YaFSDPBufferContext:
     def __init__(self, buffer_type: BufferType):
         self._buffer_type = buffer_type
 
+    @staticmethod
+    def _allocate_buffer(
+        size_in_bytes: int,
+        device: torch.device,
+        yccl_handle: "yccl.Handle | None",
+        buffer_method: str,
+    ) -> torch.Tensor:
+        return (
+            torch.empty(
+                size_in_bytes // torch.bfloat16.itemsize,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            if yccl_handle is None
+            else cast(
+                "torch.Tensor",
+                getattr(yccl_handle, buffer_method)(
+                    size_in_bytes // torch.bfloat16.itemsize
+                ),
+            )
+        ).view(torch.uint8)
+
     def lazy_init(
         self,
         sizes_by_dtype: "dict[torch.dtype | None, int]",
@@ -45,30 +67,43 @@ class YaFSDPBufferContext:
     ) -> None:
         if yccl_handles is None:
             yccl_handles = dict.fromkeys(sizes_by_dtype)
+        self._sizes_by_dtype = sizes_by_dtype
+        self._device = device
         self.yccl_handles = yccl_handles
-        buffer_method = {
+        self._buffer_method = {
             self.BufferType.ALL_GATHER: "add_all_gather_output_buffer",
             self.BufferType.REDUCE_SCATTER: "add_reduce_scatter_buffer",
         }[self._buffer_type]
         self.buffers: dict[torch.dtype | None, torch.Tensor] = {
-            dtype: (
-                torch.empty(
-                    size_in_bytes // torch.bfloat16.itemsize,
-                    dtype=torch.bfloat16,
-                    device=device,
-                )
-                if yccl_handles.get(dtype) is None
-                else cast(
-                    "torch.Tensor",
-                    getattr(yccl_handles[dtype], buffer_method)(
-                        size_in_bytes // torch.bfloat16.itemsize
-                    ),
-                )
-            ).view(torch.uint8)
+            dtype: self._allocate_buffer(
+                size_in_bytes,
+                device,
+                yccl_handles.get(dtype),
+                self._buffer_method,
+            )
             for dtype, size_in_bytes in sizes_by_dtype.items()
         }
         self.owner: YaFSDPParamGroup | None = None
         self.release_event: torch.Event | None = None
+
+    def suspend(self) -> None:
+        # YCCL remaps its buffers at the same virtual addresses on resume, so
+        # their tensor views must stay alive. NCCL scratch buffers can be dropped.
+        for dtype in tuple(self.buffers):
+            if self.yccl_handles.get(dtype) is None:
+                del self.buffers[dtype]
+        self.owner = None
+        self.release_event = None
+
+    def resume(self) -> None:
+        for dtype, size_in_bytes in self._sizes_by_dtype.items():
+            if self.yccl_handles.get(dtype) is None:
+                self.buffers[dtype] = self._allocate_buffer(
+                    size_in_bytes,
+                    self._device,
+                    None,
+                    self._buffer_method,
+                )
 
 
 class YaFSDPCommContext:
@@ -139,6 +174,8 @@ class YaFSDPParamGroup:
         self.device_handle = _get_device_handle(device.type)
         self.mp_policy = mp_policy
         self._training_state = TrainingState.IDLE
+        self._runtime_initialized = False
+        self._is_suspended = False
         # Group's sharded state always matches its parameters' sharded states
         self._sharded_state = ShardedState.SHARDED
         self._module_fqn: str | None = None  # prefixed from root module
@@ -232,6 +269,7 @@ class YaFSDPParamGroup:
         self._padded_sharded_param_numel: dict[torch.dtype | None, int] = {}
         self._padded_sharded_param_data: dict[torch.dtype | None, torch.Tensor] = {}
         self._all_gather_input_set_dtypes: set[torch.dtype | None] = set()
+        self._yccl_all_gather_input: dict[torch.dtype | None, torch.Tensor] = {}
         self._padded_sharded_param_grad: dict[
             torch.dtype | None, torch.Tensor | None
         ] = {}
@@ -486,13 +524,19 @@ class YaFSDPParamGroup:
 
     def lazy_init(self) -> None:
         # Lazy init should be idempotent
+        if self._runtime_initialized:
+            return
         if not hasattr(self.comm_ctx, "device_handle"):
             self.comm_ctx.device_handle = _get_device_handle(self.device.type)
         self._validate_no_meta_params()
         self._register_state_dict_hooks()
+        self._init_runtime_state(allocate_yccl_inputs=True)
+
+    def _init_runtime_state(self, *, allocate_yccl_inputs: bool) -> None:
         self._init_unsharded_params()
         self._all_gather_input = {}
         self._reduce_scatter_output = {}
+        self._all_gather_input_set_dtypes.clear()
         for (
             all_gather_dtype,
             fsdp_params,
@@ -508,15 +552,21 @@ class YaFSDPParamGroup:
                     )
                 )
             else:
-                self._all_gather_input[all_gather_dtype] = (
-                    yccl_handle.add_all_gather_input_buffer(
-                        self._padded_sharded_param_numel[all_gather_dtype]
-                        * (
-                            all_gather_dtype or self.param_dtype or self.orig_dtype
-                        ).itemsize
-                        // torch.bfloat16.itemsize
-                    ).view(all_gather_dtype or self.param_dtype or self.orig_dtype)
-                )
+                if allocate_yccl_inputs:
+                    self._yccl_all_gather_input[all_gather_dtype] = (
+                        yccl_handle.add_all_gather_input_buffer(
+                            self._padded_sharded_param_numel[all_gather_dtype]
+                            * (
+                                all_gather_dtype or self.param_dtype or self.orig_dtype
+                            ).itemsize
+                            // torch.bfloat16.itemsize
+                        ).view(all_gather_dtype or self.param_dtype or self.orig_dtype)
+                    )
+                elif all_gather_dtype not in self._yccl_all_gather_input:
+                    raise RuntimeError("Missing suspended YCCL all-gather input buffer")
+                self._all_gather_input[all_gather_dtype] = self._yccl_all_gather_input[
+                    all_gather_dtype
+                ]
             for fsdp_param, param_all_gather_input in zip(
                 fsdp_params,
                 self._all_gather_input[all_gather_dtype][
@@ -545,6 +595,100 @@ class YaFSDPParamGroup:
                     strict=True,
                 ):
                     fsdp_param.init_reduce_scatter_output(param_reduce_scatter_output)
+        self._runtime_initialized = True
+
+    def suspend(self) -> None:
+        if self._training_state != TrainingState.IDLE:
+            raise RuntimeError(
+                f"Cannot suspend {self} while it is in {self._training_state.name}"
+            )
+        if not self.is_sharded:
+            raise RuntimeError(f"Cannot suspend unsharded {self}")
+        if self._all_gather_result is not None or self._post_reduce_event is not None:
+            raise RuntimeError(f"Cannot suspend {self} with pending communication")
+        if self.unsharded_accumulated_grads_present:
+            raise RuntimeError(f"Cannot suspend {self} with accumulated gradients")
+        for fsdp_param in self.fsdp_params:
+            if type(fsdp_param._sharded_local_tensor) is not torch.Tensor:
+                raise NotImplementedError(
+                    "YaFSDP suspend() does not support parameter tensor subclasses: "
+                    f"{fsdp_param}"
+                )
+
+        self._all_gather_input = {}
+        self._all_gather_output = {}
+        self._reduce_scatter_input = {}
+        self._reduce_scatter_output = {}
+        self._all_gather_input_set_dtypes.clear()
+        for fsdp_param in self.fsdp_params:
+            for attr_name in (
+                "_all_gather_input",
+                "_all_gather_output",
+                "unsharded_param",
+            ):
+                if hasattr(fsdp_param, attr_name):
+                    delattr(fsdp_param, attr_name)
+            fsdp_param._unsharded_accumulated_grad = None
+            fsdp_param.unsharded_accumulated_grad = None
+            fsdp_param.reduce_scatter_output = None
+            if hasattr(fsdp_param, "_extensions_data"):
+                fsdp_param._extensions_data.clear()
+        self._move_sharded_state(torch.device("cpu"))
+        self._runtime_initialized = False
+        self._is_suspended = True
+
+    def resume(self) -> None:
+        if not self._is_suspended:
+            return
+        self._move_sharded_state(self.device)
+        self._init_runtime_state(allocate_yccl_inputs=False)
+        self._is_suspended = False
+
+    @property
+    def unsharded_accumulated_grads_present(self) -> bool:
+        return any(
+            fsdp_param.unsharded_accumulated_grad is not None
+            for fsdp_param in self.fsdp_params
+        )
+
+    @torch.no_grad()
+    def _move_sharded_state(self, device: torch.device) -> None:
+        for (
+            all_gather_dtype,
+            fsdp_params,
+        ) in self._all_gather_dtype_to_fsdp_params.items():
+            data = self._padded_sharded_param_data[all_gather_dtype].to(device)
+            old_grad = self._padded_sharded_param_grad[all_gather_dtype]
+            grad = old_grad.to(device) if old_grad is not None else None
+            self._padded_sharded_param_data[all_gather_dtype] = data
+            self._padded_sharded_param_grad[all_gather_dtype] = grad
+
+            shard_numels = self._sharded_param_numels[all_gather_dtype]
+            data_views = data[: sum(shard_numels)].split(shard_numels)
+            grad_views = (
+                grad[: sum(shard_numels)].split(shard_numels)
+                if grad is not None
+                else (None,) * len(shard_numels)
+            )
+            for fsdp_param, data_view, grad_view in zip(
+                fsdp_params, data_views, grad_views, strict=True
+            ):
+                sharded_param = fsdp_param.sharded_param
+                had_grad = sharded_param.grad is not None
+                replacement = nn.Parameter(
+                    fsdp_param.to_sharded_dtensor(data_view),
+                    requires_grad=sharded_param.requires_grad,
+                )
+                torch.utils.swap_tensors(sharded_param, replacement)
+                fsdp_param._sharded_param_data = data_view
+                fsdp_param.sharded_param_grad = (
+                    fsdp_param.to_sharded_dtensor(cast("torch.Tensor", grad_view))
+                    if grad_view is not None
+                    else None
+                )
+                if had_grad:
+                    sharded_param.grad = fsdp_param.sharded_param_grad
+                fsdp_param._setattr_on_modules(sharded_param)
 
     # Runtime #
     def unshard(self, async_op: bool = False) -> None:
@@ -893,6 +1037,10 @@ class YaFSDPParamGroup:
         }
 
         def to_sharded_hook(*args: Any, **kwargs: Any) -> None:
+            if self._is_suspended:
+                raise RuntimeError(
+                    "Cannot access a YaFSDP state dict while suspended; call resume() first"
+                )
             self._to_sharded()
 
         for module in modules_with_fsdp_params:

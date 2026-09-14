@@ -1,6 +1,7 @@
 import functools
 import logging
 from collections.abc import Callable, Sequence
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -36,6 +37,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger("ya_fsdp")
 
 
+class _LifecycleState(Enum):
+    ACTIVE = auto()
+    SUSPENDED = auto()
+
+
 class YaFSDPStateContext:
     def __init__(self) -> None:
         # All YaFSDP states in the root state's module tree
@@ -51,6 +57,7 @@ class YaFSDPStateContext:
         # Optional user-provided event recorded after optimizer for the
         # all-gather streams to wait on in the root pre-forward
         self.post_optim_event: torch.Event | None = None
+        self.lifecycle_state: _LifecycleState = _LifecycleState.ACTIVE
 
 
 class YaFSDPState(_State):
@@ -103,6 +110,10 @@ class YaFSDPState(_State):
     def _root_pre_forward(
         self, module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        if self._state_ctx.lifecycle_state is not _LifecycleState.ACTIVE:
+            raise RuntimeError(
+                "YaFSDP is suspended; call resume() on the root module before forward"
+            )
         self._lazy_init()
         if self._state_ctx.iter_forward_root is not None:
             return args, kwargs
@@ -123,6 +134,90 @@ class YaFSDPState(_State):
                     )  # same as DDP
                 args, kwargs = args_tuple[0], kwargs_tuple[0]
         return args, kwargs
+
+    def suspend(self) -> None:
+        self._lazy_init()
+        if not self._is_root:
+            raise RuntimeError("YaFSDP suspend() must be called on the root module")
+        if self._state_ctx.lifecycle_state is _LifecycleState.SUSPENDED:
+            return
+        if self._state_ctx.lifecycle_state is not _LifecycleState.ACTIVE:
+            raise RuntimeError(
+                "Cannot suspend YaFSDP in "
+                f"{self._state_ctx.lifecycle_state.name.lower()} state"
+            )
+        if self._state_ctx.iter_forward_root is not None:
+            raise RuntimeError("Cannot suspend YaFSDP during forward")
+        if self._state_ctx.post_backward_final_callback_queued:
+            raise RuntimeError("Cannot suspend YaFSDP before backward is finalized")
+
+        param_groups = self._param_groups()
+        for param_group in reversed(param_groups):
+            param_group.reshard()
+        self._device_handle.synchronize(self._device)
+        for param_group in param_groups:
+            param_group.suspend()
+        self._device_handle.synchronize(self._device)
+        for buffer_ctx in self._buffer_contexts(param_groups):
+            buffer_ctx.suspend()
+        for yccl_handle in self._yccl_handles(param_groups):
+            yccl_handle.suspend()
+        self._state_ctx.lifecycle_state = _LifecycleState.SUSPENDED
+
+    def resume(self) -> None:
+        if self._state_ctx.lifecycle_state is _LifecycleState.ACTIVE:
+            return
+        if self._state_ctx.lifecycle_state is not _LifecycleState.SUSPENDED:
+            raise RuntimeError(
+                "Cannot resume YaFSDP in "
+                f"{self._state_ctx.lifecycle_state.name.lower()} state"
+            )
+        if not self._is_root:
+            raise RuntimeError("YaFSDP resume() must be called on the root module")
+
+        param_groups = self._param_groups()
+        for yccl_handle in self._yccl_handles(param_groups):
+            yccl_handle.resume()
+        for buffer_ctx in self._buffer_contexts(param_groups):
+            buffer_ctx.resume()
+        for param_group in param_groups:
+            param_group.resume()
+        self._device_handle.synchronize(self._device)
+        self._state_ctx.lifecycle_state = _LifecycleState.ACTIVE
+
+    def _param_groups(self) -> list[YaFSDPParamGroup]:
+        return [
+            param_group
+            for state in self._state_ctx.all_states
+            if (param_group := state._fsdp_param_group) is not None
+        ]
+
+    @staticmethod
+    def _buffer_contexts(
+        param_groups: list[YaFSDPParamGroup],
+    ) -> list[YaFSDPBufferContext]:
+        contexts: list[YaFSDPBufferContext] = []
+        seen: set[int] = set()
+        for param_group in param_groups:
+            for buffer_ctx in (
+                param_group.data_buffer_ctx,
+                param_group.grad_buffer_ctx,
+            ):
+                if buffer_ctx is not None and id(buffer_ctx) not in seen:
+                    seen.add(id(buffer_ctx))
+                    contexts.append(buffer_ctx)
+        return contexts
+
+    @classmethod
+    def _yccl_handles(cls, param_groups: list[YaFSDPParamGroup]) -> list["yccl.Handle"]:
+        handles: list[yccl.Handle] = []
+        seen: set[int] = set()
+        for buffer_ctx in cls._buffer_contexts(param_groups):
+            for handle in buffer_ctx.yccl_handles.values():
+                if handle is not None and id(handle) not in seen:
+                    seen.add(id(handle))
+                    handles.append(handle)
+        return handles
 
     def _lazy_init(
         self,
