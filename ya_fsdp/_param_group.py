@@ -749,10 +749,6 @@ class YaFSDPParamGroup:
             "%s", self._with_fqn(f"YaFSDP::{self._training_state.name.lower()}_reshard")
         )
         self._to_sharded()
-        self.data_buffer_ctx.release_event = (
-            self.device_handle.current_stream().record_event()
-        )
-        self.data_buffer_ctx.owner = None
 
     def pre_forward(
         self, module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]
@@ -969,6 +965,10 @@ class YaFSDPParamGroup:
             for fsdp_param in self.fsdp_params:
                 fsdp_param.to_sharded()
             self._sharded_state = ShardedState.SHARDED
+            self.data_buffer_ctx.release_event = (
+                self.device_handle.current_stream().record_event()
+            )
+            self.data_buffer_ctx.owner = None
 
     def _to_unsharded(self) -> None:
         if not self.is_unsharded:
