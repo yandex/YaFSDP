@@ -65,11 +65,19 @@ def materialize_params(meta_params, buffer, grad_buffer):
 
 def convert_some_params_to_metaparams(module, parent_name, filter_func):
     metaparams = []
+    # Track visited parameters so a shared/tied `nn.Parameter` (e.g. an
+    # embedding tied to a projection head) is converted only once. Without
+    # this, the same tensor is materialized into two buffer slices, which
+    # both double-counts its elements and breaks the weight tie.
+    visited_params: set = set()
 
     def convert_params_to_metaparams_recursive(module, parent_name):
         for name, param in module.named_parameters(recurse=False):
             if not filter_func(param):
                 continue
+            if param in visited_params:
+                continue
+            visited_params.add(param)
             metaparams.append(MetaParam(module, parent_name, name, param))
         for submodule_name, submodule in module.named_children():
             if submodule_name == "module":
