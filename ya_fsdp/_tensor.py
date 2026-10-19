@@ -186,7 +186,7 @@ class RaggedShardDTensor(torch.Tensor):
             rng_context = random._rng_tracker._distribute_region(
                 DTensorSpec(
                     arg._spec.mesh,
-                    (Shard(0), arg._spec.placements[1:]),
+                    (Shard(0), *arg._spec.placements[1:]),
                     arg._spec.tensor_meta,
                 )
             )
@@ -199,7 +199,7 @@ class RaggedShardDTensor(torch.Tensor):
             rng_context = random._rng_tracker._distribute_region(
                 DTensorSpec(
                     arg._spec.mesh,
-                    (Shard(0), arg._spec.placements[1:]),
+                    (Shard(0), *arg._spec.placements[1:]),
                     arg._spec.tensor_meta,
                 )
             )
