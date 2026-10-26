@@ -273,6 +273,8 @@ class YaFSDPParamGroup:
         self._padded_sharded_param_grad: dict[
             torch.dtype | None, torch.Tensor | None
         ] = {}
+        self._host_sharded_param_data: dict[torch.dtype | None, torch.Tensor] = {}
+        self._host_sharded_param_grad: dict[torch.dtype | None, torch.Tensor] = {}
         self._sharded_param_numels: dict[torch.dtype | None, list[int]] = {}
         sharded_data_global_offsets: dict[torch.dtype | None, list[int]] = {}
 
@@ -657,9 +659,22 @@ class YaFSDPParamGroup:
             all_gather_dtype,
             fsdp_params,
         ) in self._all_gather_dtype_to_fsdp_params.items():
-            data = self._padded_sharded_param_data[all_gather_dtype].to(device)
+            old_data = self._padded_sharded_param_data[all_gather_dtype]
             old_grad = self._padded_sharded_param_grad[all_gather_dtype]
-            grad = old_grad.to(device) if old_grad is not None else None
+            if device.type == "cpu" and old_data.device.type != "cpu":
+                data = self._copy_to_host_buffer(
+                    old_data, self._host_sharded_param_data, all_gather_dtype
+                )
+                grad = (
+                    self._copy_to_host_buffer(
+                        old_grad, self._host_sharded_param_grad, all_gather_dtype
+                    )
+                    if old_grad is not None
+                    else None
+                )
+            else:
+                data = old_data.to(device)
+                grad = old_grad.to(device) if old_grad is not None else None
             self._padded_sharded_param_data[all_gather_dtype] = data
             self._padded_sharded_param_grad[all_gather_dtype] = grad
 
@@ -689,6 +704,28 @@ class YaFSDPParamGroup:
                 if had_grad:
                     sharded_param.grad = fsdp_param.sharded_param_grad
                 fsdp_param._setattr_on_modules(sharded_param)
+
+    @staticmethod
+    def _copy_to_host_buffer(
+        tensor: torch.Tensor,
+        buffers: dict[torch.dtype | None, torch.Tensor],
+        all_gather_dtype: torch.dtype | None,
+    ) -> torch.Tensor:
+        """Copy into a host buffer reused across offloads.
+
+        A fresh pageable allocation page-faults during the copy, which is ~10x slower than
+        copying into already-touched memory when every rank on a node offloads at once.
+        """
+        buffer = buffers.get(all_gather_dtype)
+        if (
+            buffer is None
+            or buffer.shape != tensor.shape
+            or buffer.dtype != tensor.dtype
+        ):
+            buffer = torch.empty_like(tensor, device="cpu")
+            buffers[all_gather_dtype] = buffer
+        buffer.copy_(tensor)
+        return buffer
 
     # Runtime #
     def unshard(self, async_op: bool = False) -> None:
